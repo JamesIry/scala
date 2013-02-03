@@ -72,9 +72,6 @@ abstract class DeadCodeElimination extends SubComponent {
     /** Map from a local and a basic block to the instructions that store to that local in that basic block */
     val localStores = mutable.Map[(Local, BasicBlock), mutable.BitSet]() withDefault {_ => mutable.BitSet()}
     
-    /** Stores that clobber previous stores to array or ref locals. See SI-5313 */
-    val clobbers = mutable.Set[InstrLoc]()
-
     /** the current method. */
     var method: IMethod = _
 
@@ -86,7 +83,6 @@ abstract class DeadCodeElimination extends SubComponent {
         debuglog("dead code elimination on " + m);
         dropOf.clear()
         localStores.clear()
-        clobbers.clear()
         m.code.blocks.clear()
         accessedLocals = m.params.reverse
         m.code.blocks ++= linearizer.linearize(m)
@@ -203,15 +199,6 @@ abstract class DeadCodeElimination extends SubComponent {
                 worklist += ((bb1, idx1))
               }
 
-            case STORE_LOCAL(l1) if l1.kind.isRefOrArrayType => 
-              addDefs()
-              // see SI-5313
-              // search for clobbers of this store if we aren't doing l1 = null
-              // this doesn't catch the second store in x=null;l1=x; but in practice this catches
-              // a lot of null stores very cheaply
-              if (idx == 0 || bb(idx - 1) != CONSTANT(Constant(null)))
-                 findClobbers(l1, bb, idx + 1)
-                
             case nw @ NEW(REFERENCE(sym)) =>
               assert(nw.init ne null, "null new.init at: " + bb + ": " + idx + "(" + instr + ")")
               worklist += findInstruction(bb, nw.init)
@@ -238,64 +225,65 @@ abstract class DeadCodeElimination extends SubComponent {
     }
     
     /**
-     * Finds and marks all clobbers of the given local starting in the given
-     * basic block at the given index
+     * Determines if the instruction in bb at index idx is a clobber
+     * of local l
      * 
      * Storing to local variables of reference or array type may be indirectly
      * observable because it may remove a reference to an object which may allow the object 
      * to be gc'd. See SI-5313. In this code I call the LOCAL_STORE(s) that immediately follow a 
-     * LOCAL_STORE and that store to the same local "clobbers." If a LOCAL_STORE is marked 
-     * useful then its clobbers must go into the set of clobbers, which will be
-     * compensated for later
+     * LOCAL_STORE and that store to the same local "clobbers."
+     * 
+     * The code searches backwards through this block and predecessor blocks looking to see
+     * if the same local has any stores marked useful. If so then this instruction
+     * is a clobber.
      */
-    def findClobbers(l: Local, bb: BasicBlock, idx: Int) {
+    def isClobber(l: Local, bb: BasicBlock, idx: Int) = {
         // previously visited blocks tracked to prevent searching forever in a cycle
         val inspected = mutable.Set[BasicBlock]()
         // our worklist of blocks that still need to be checked
         val blocksToBeInspected = mutable.Set[BasicBlock]()
         
-        // Tries to find the next clobber of l1 in bb1 starting at idx1. 
-        // if it finds one it adds the clobber to clobbers set for later
-        // handling. If not it adds the direct successor blocks to 
-        // the uninspectedBlocks to try to find clobbers there. Either way
-        // it adds the exception successor blocks for further search
-        def findClobberInBlock(idx1: Int, bb1: BasicBlock) {                
+        // Tries to find the last store of l1 in bb1 before idx1.
+        // if it finds one that is marked useful then it returns true, the
+        // original instruction being checked was a clobber.
+        // if it finds an unused store then it returns false, the
+        // instruction being checked is not a clobber of a store
+        // in this block. If it doesnt' find a store then it
+        // adds the predecessor blocks to the worklist of blocks for further search
+        def isClobberInBlock(idx1: Int, bb1: BasicBlock) = {                
           val key = ((l, bb1))
-          val foundClobber = (localStores contains key) && {
-            def minIdx(s : mutable.BitSet) = if(s.isEmpty) -1 else s.min
+          (localStores contains key) && {
+            def maxIdx(s : mutable.BitSet) = if(s.isEmpty) -1 else s.max
 
-            // find the smallest index greater than or equal to idx1
-            val clobberIdx = minIdx(localStores(key) dropWhile (_ < idx1))
-            if (clobberIdx == -1) 
+            // find the largest index less than than or equal to idx1
+            val clobberedIdx = maxIdx(localStores(key) takeWhile (_ < idx1))
+            if (clobberedIdx == -1) {
+              // didn't find a store to l in this block, so we need to look in predecessor blocks
+              blocksToBeInspected ++= (bb1.predecessors filterNot inspected)
               false
-            else {
-              debuglog(s"\t${bb1(clobberIdx)} is a clobber of ${bb(idx)}")
-              clobbers += ((bb1, clobberIdx))
+              // don't count it as a clobber if the apparently clobbered instruction was not useful or is a store of null
+            } else if (useful(bb1)(clobberedIdx) && (clobberedIdx == 0 || bb1(clobberedIdx - 1) != CONSTANT(Constant(null)))) {
+              debuglog(s"\t${bb(idx)} is a clobber of ${bb1(clobberedIdx)}")
               true
+            } else {
+              debuglog(s"\t${bb(idx)} writes over unused or null store ${bb1(clobberedIdx)}")
+              false              
             }
-          }
-
-          // always need to look into the exception successors for additional clobbers 
-          // because we don't know when flow might enter an exception handler
-          blocksToBeInspected ++= (bb1.exceptionSuccessors filterNot inspected)
-          // If we didn't find a clobber here then we need to look at successor blocks.
-          // if we found a clobber then we don't need to search in the direct successors
-          if (!foundClobber) {
-            blocksToBeInspected ++= (bb1.directSuccessors filterNot inspected)
           }
         }
         
-        // first search starting at the current index
+        // first search backward starting at the current index
         // note we don't put bb in the inspected list yet because a loop may later force
-        // us back around to search from the beginning of bb
-        findClobberInBlock(idx, bb)
+        // us back around to search from the end of bb
+        var clobber = isClobberInBlock(idx, bb)
         // then loop until we've exhausted the set of uninspected blocks
-        while(!blocksToBeInspected.isEmpty) {
+        while(!(clobber || blocksToBeInspected.isEmpty)) {
           val bb1 = blocksToBeInspected.head
           blocksToBeInspected -= bb1
           inspected += bb1
-          findClobberInBlock(0, bb1)
+          clobber = isClobberInBlock(bb1.length, bb1)
         }
+        clobber
     }
 
     def sweep(m: IMethod) {
@@ -310,10 +298,6 @@ abstract class DeadCodeElimination extends SubComponent {
           if (useful(bb)(idx)) {
 //            log(" " + i + " is useful")
             bb.emit(i, i.pos)
-            compensations.get(bb, idx) match {
-              case Some(is) => is foreach bb.emit
-              case None => ()
-            }
             // check for accessed locals
             i match {
               case LOAD_LOCAL(l) if !l.arg =>
@@ -326,13 +310,11 @@ abstract class DeadCodeElimination extends SubComponent {
             i match {
               case NEW(REFERENCE(sym)) =>
                 log(s"Eliminated instantation of $sym inside $m")
-              case STORE_LOCAL(l) if clobbers contains ((bb, idx)) =>
-                // if an unused instruction was a clobber of a used store to a reference or array type
-                // then we'll replace it with the store of a null to make sure the reference is 
-                // eliminated. See SI-5313
-                bb emit CONSTANT(Constant(null))
-                bb emit STORE_LOCAL(l)
               case _ => ()
+            }
+            compensations.get(bb, idx) match {
+              case Some(is) => is foreach bb.emit
+              case None     => ()
             }
             debuglog("Skipped: bb_" + bb + ": " + idx + "( " + i + ")")
           }
@@ -350,25 +332,34 @@ abstract class DeadCodeElimination extends SubComponent {
         assert(bb.closed, "Open block in computeCompensations")
         foreachWithIndex(bb.toList) { (i, idx) =>
           if (!useful(bb)(idx)) {
+            bb(idx) match {
+              case STORE_LOCAL(l) if l.kind.isRefOrArrayType && isClobber(l, bb, idx) =>
+                // if an unused instruction was a clobber of a used store to a reference or array type
+                // then we'll replace it with the store of a null to make sure the reference is 
+                // eliminated. See SI-5313
+                compensations((bb, idx)) = List(CONSTANT(Constant(null)), STORE_LOCAL(l))
+              case _ => ()
+            }
             foreachWithIndex(i.consumedTypes.reverse) { (consumedType, depth) =>
               debuglog("Finding definitions of: " + i + "\n\t" + consumedType + " at depth: " + depth)
               val defs = rdef.findDefs(bb, idx, 1, depth)
               for (d <- defs) {
                 val (bb, idx) = d
-                bb(idx) match {
-                  case DUP(_) if idx > 0 =>
-                    bb(idx - 1) match {
-                      case nw @ NEW(_) =>
-                        val init = findInstruction(bb, nw.init)
-                        log("Moving DROP to after <init> call: " + nw.init)
-                        compensations(init) = List(DROP(consumedType))
-                      case _ =>
-                        compensations(d) = List(DROP(consumedType))
-                    }
-                  case _ =>
-                    compensations(d) = List(DROP(consumedType))
+                if(useful(bb)(idx))
+                  bb(idx) match {
+                    case DUP(_) if idx > 0 =>
+                      bb(idx - 1) match {
+                        case nw @ NEW(_) =>
+                          val init = findInstruction(bb, nw.init)
+                          log("Moving DROP to after <init> call: " + nw.init)
+                          compensations(init) = List(DROP(consumedType))
+                        case _ =>
+                          compensations(d) = List(DROP(consumedType))
+                      }
+                    case _ =>
+                      compensations(d) = List(DROP(consumedType))
+                  }
                 }
-              }
             }
           }
         }
