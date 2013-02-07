@@ -6622,10 +6622,8 @@ trait Types extends api.Types { self: SymbolTable =>
     def stripType(tp: Type): Type = tp match {
       case ExistentialType(_, res) =>
         res
-      case tv@TypeVar(_, constr) =>
-        if (tv.instValid) stripType(constr.inst)
-        else if (tv.untouchable) tv
-        else abort("trying to do lub/glb of typevar "+tp)
+      case tv@TypeVar(_, constr) if tv.instValid =>
+        stripType(constr.inst)
       case t => t
     }
     val strippedTypes = ts mapConserve stripType
