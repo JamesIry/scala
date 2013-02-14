@@ -1666,7 +1666,7 @@ trait Symbols extends api.Symbols { self: SymbolTable =>
 
     def suchThat(cond: Symbol => Boolean): Symbol = {
       val result = filter(cond)
-      assert(!result.isOverloaded, result.alternatives)
+      assert(!result.isOverloaded, s"${result} is overloaded by alternatives ${result.alternatives map (_.debugLocationString) mkString (" and ")}")
       result
     }
 
