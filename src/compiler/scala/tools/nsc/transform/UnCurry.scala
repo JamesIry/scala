@@ -228,7 +228,7 @@ abstract class UnCurry extends InfoTransform
       deEta(fun) match {
         // nullary or parameterless
         case fun1 if fun1 ne fun => fun1
-        case _ =>
+        case _ if settings.Ydelambdafy.value == "inline" =>
           val parents = addSerializable(abstractFunctionForFunctionType(fun.tpe))
           val anonClass = fun.symbol.owner newAnonymousFunctionClass(fun.pos, inConstructorFlag) addAnnotation serialVersionUIDAnnotation
           anonClass setInfo ClassInfoType(parents, newScope, anonClass)
@@ -260,7 +260,8 @@ abstract class UnCurry extends InfoTransform
               List(ClassDef(anonClass, NoMods, ListOfNil, List(applyMethodDef), fun.pos)),
               Typed(New(anonClass.tpe), TypeTree(fun.tpe)))
           }
-
+        // if Ydelambdafy isn't inline then we won't change the function now
+        case _ => fun
       }
     }
 
@@ -394,7 +395,7 @@ abstract class UnCurry extends InfoTransform
         deriveDefDef(dd)(_ => body)
       case _ => tree
     }
-    def isNonLocalReturn(ret: Return) = ret.symbol != currentOwner.enclMethod || currentOwner.isLazy
+    def isNonLocalReturn(ret: Return) = ret.symbol != currentOwner.enclMethod || currentOwner.isLazy || currentOwner.isAnonymousFunction
 
 // ------ The tree transformers --------------------------------------------------------
 
@@ -508,8 +509,12 @@ abstract class UnCurry extends InfoTransform
             treeCopy.CaseDef(tree, pat1, transform(guard), transform(body))
 
           case fun @ Function(_, _) =>
-            mainTransform(transformFunction(fun))
-
+            val fun1 = transformFunction(fun)
+            if (fun1 ne fun)
+              mainTransform(fun1)
+            else
+              super.transform(fun1)
+ 
           case Template(_, _, _) =>
             withInConstructorFlag(0) { super.transform(tree) }
 

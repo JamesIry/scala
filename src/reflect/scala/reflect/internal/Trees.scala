@@ -1707,6 +1707,12 @@ trait Trees extends api.Trees { self: SymbolTable =>
     case t =>
       sys.error("Not a LabelDef: " + t + "/" + t.getClass)
   }
+  def derivePackageDef(ldef: Tree)(applyToRhs: List[Tree] => List[Tree]): PackageDef = ldef match {
+    case PackageDef(pid0, stats0) =>
+      treeCopy.PackageDef(ldef, pid0, applyToRhs(stats0))
+    case t =>
+      sys.error("Not a PackageDef: " + t + "/" + t.getClass)      
+  }
 
 // -------------- Classtags --------------------------------------------------------
 

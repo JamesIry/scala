@@ -560,13 +560,20 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
     val runsAfter = List("flatten", "constructors")
     val runsRightAfter = None
   } with Mixin
-
+  
   // phaseName = "cleanup"
   object cleanup extends {
     val global: Global.this.type = Global.this
     val runsAfter = List("mixin")
     val runsRightAfter = None
   } with CleanUp
+
+  // phaseName = "delambdafy"
+  object delambdafy extends {
+    val global: Global.this.type = Global.this
+    val runsAfter = List("cleanup")
+    val runsRightAfter = None
+  } with Delambdafy
 
   // phaseName = "icode"
   object genicode extends {
@@ -682,6 +689,7 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
       lambdaLift              -> "move nested functions to top level",
       constructors            -> "move field definitions into constructors",
       mixer                   -> "mixin composition",
+      delambdafy              -> "remove lambdas",
       cleanup                 -> "platform-specific cleanups, generate reflective calls",
       genicode                -> "generate portable intermediate code",
       inliner                 -> "optimization: do inlining",
@@ -1043,6 +1051,7 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
   @inline final def exitingExplicitOuter[T](op: => T): T  = exitingPhase(currentRun.explicitouterPhase)(op)
   @inline final def exitingFlatten[T](op: => T): T        = exitingPhase(currentRun.flattenPhase)(op)
   @inline final def exitingMixin[T](op: => T): T          = exitingPhase(currentRun.mixinPhase)(op)
+  @inline final def exitingDelambdafy[T](op: => T): T     = exitingPhase(currentRun.delambdafyPhase)(op)
   @inline final def exitingPickler[T](op: => T): T        = exitingPhase(currentRun.picklerPhase)(op)
   @inline final def exitingRefchecks[T](op: => T): T      = exitingPhase(currentRun.refchecksPhase)(op)
   @inline final def exitingSpecialize[T](op: => T): T     = exitingPhase(currentRun.specializePhase)(op)
@@ -1053,6 +1062,7 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
   @inline final def enteringFlatten[T](op: => T): T       = enteringPhase(currentRun.flattenPhase)(op)
   @inline final def enteringIcode[T](op: => T): T         = enteringPhase(currentRun.icodePhase)(op)
   @inline final def enteringMixin[T](op: => T): T         = enteringPhase(currentRun.mixinPhase)(op)
+  @inline final def enteringDelambdafy[T](op: => T): T    = enteringPhase(currentRun.delambdafyPhase)(op)
   @inline final def enteringPickler[T](op: => T): T       = enteringPhase(currentRun.picklerPhase)(op)
   @inline final def enteringRefchecks[T](op: => T): T     = enteringPhase(currentRun.refchecksPhase)(op)
   @inline final def enteringTyper[T](op: => T): T         = enteringPhase(currentRun.typerPhase)(op)
@@ -1343,6 +1353,7 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
     // val constructorsPhase            = phaseNamed("constructors")
     val flattenPhase                 = phaseNamed("flatten")
     val mixinPhase                   = phaseNamed("mixin")
+    val delambdafyPhase              = phaseNamed("delambdafy")
     val cleanupPhase                 = phaseNamed("cleanup")
     val icodePhase                   = phaseNamed("icode")
     val inlinerPhase                 = phaseNamed("inliner")
