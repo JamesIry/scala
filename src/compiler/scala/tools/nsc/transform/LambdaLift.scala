@@ -156,7 +156,8 @@ abstract class LambdaLift extends InfoTransform {
           val ss = symSet(free, enclosure)
           if (!ss(sym)) {
             ss += sym
-            renamable += sym
+            if (!(enclosure.isAnonymousFunction && !enclosure.isClass))
+              renamable += sym
             changedFreeVars = true
             debuglog("" + sym + " is free in " + enclosure)
             if (sym.isVariable) sym setFlag CAPTURED
@@ -302,7 +303,11 @@ abstract class LambdaLift extends InfoTransform {
           val newFlags = SYNTHETIC | ( if (owner.isClass) PARAMACCESSOR | PrivateLocal else PARAM )
           debuglog("free var proxy: %s, %s".format(owner.fullLocationString, freeValues.toList.mkString(", ")))
           proxies(owner) =
-            for (fv <- freeValues.toList) yield {
+            if (owner.isAnonymousFunction && !owner.isClass) {
+              // we don't want to proxy free variables in unexpanded anonymous functions here, we'll do that later in delambdafy
+              // (doing it here would create the confusing situation where a free variable have no binding anywhere)
+              freeValues.toList
+            } else for (fv <- freeValues.toList) yield {
               val proxyName = proxyNames.getOrElse(fv, fv.name)
               val proxy = owner.newValue(proxyName.toTermName, owner.pos, newFlags.toLong) setInfo fv.info
               if (owner.isClass) owner.info.decls enter proxy
@@ -376,6 +381,9 @@ abstract class LambdaLift extends InfoTransform {
       case Some(ps) =>
         val freeParams = ps map (p => ValDef(p) setPos tree.pos setType NoType)
         tree match {
+          case Function(_, _) =>
+            // attach the free symbols to the function for later transformation in delambdafy
+            tree.updateAttachment(ps)
           case DefDef(_, _, _, vparams :: _, _, _) =>
             val addParams = cloneSymbols(ps).map(_.setFlag(PARAM))
             sym.updateInfo(
@@ -450,6 +458,8 @@ abstract class LambdaLift extends InfoTransform {
     private def postTransform(tree: Tree, isBoxedRef: Boolean = false): Tree = {
       val sym = tree.symbol
       tree match {
+        case Function(_, _) =>
+          addFreeParams(tree, sym)
         case ClassDef(_, _, _, _) =>
           val tree1 = addFreeParams(tree, sym)
           if (sym.isLocal) liftDef(tree1) else tree1
