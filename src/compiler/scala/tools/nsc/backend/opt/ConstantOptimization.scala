@@ -68,6 +68,11 @@ abstract class ConstantOptimization extends SubComponent {
         }
       }
     }
+    
+    /**
+     * A single possible location for the code that generated a value. In the form of a BasicBlock and index of the instruction
+     */
+    private case class SourceLocation(block: BasicBlock, idx: Int)
 
     /**
      * A single possible (or impossible) datum that can be held in Contents
@@ -95,12 +100,12 @@ abstract class ConstantOptimization extends SubComponent {
        * Hash code consistent with equals
        */
       override def hashCode = if (this.isIntAssignable) this.toInt else c.hashCode
-
     }
+    
     /**
-     * A datum that has been Boxed via a BOX instruction
+     * Info that has been Boxed via a BOX instruction
      */
-    private case class Boxed(c: Datum) extends Datum
+    private case class Boxed(info: Info) extends Datum
 
     /**
      * The knowledge we have about the abstract state of one location in terms
@@ -113,19 +118,19 @@ abstract class ConstantOptimization extends SubComponent {
      * Possible(xs) > Impossible(ys)
      * Impossible(xs + y) > Impossible(xs)
      *
-     * and the following merges, which indicate merging knowledge from two paths through
+     * and the following unions, which indicate merging knowledge from two paths through
      * the code,
      *
      * // left must be 1 or 2, right must be 2 or 3 then we must have a 1, 2 or 3
-     * Possible(xs) merge Possible(ys) => Possible(xs union ys)
+     * Possible(xs) union Possible(ys) => Possible(xs union ys)
      * 
      * // Left says can't be 2 or 3, right says can't be 3 or 4
      * // then it's not 3 (it could be 2 from the right or 4 from the left)
-     * Impossible(xs) merge Impossible(ys) => Impossible(xs intersect ys)
+     * Impossible(xs) union Impossible(ys) => Impossible(xs intersect ys)
      * 
      * // Left says it can't be 2 or 3, right says it must be 3 or 4, then
      * // it can't be 2 (left rules out 4 and right says 3 is possible)
-     * Impossible(xs) merge Possible(ys) => Impossible(xs -- ys)
+     * Impossible(xs) union Possible(ys) => Impossible(xs -- ys)
      * 
      * Intuitively, Possible(empty) says that a location can't hold anything,
      * it's uninitialized. However, Possible(empty) never appears in the code.
@@ -136,11 +141,11 @@ abstract class ConstantOptimization extends SubComponent {
      */
     private sealed abstract class Contents {
       /**
-       * Join this Contents with another coming from another path. Join enforces
+       * Union this Contents with another coming from another path. union enforces
        * the lattice structure. It is symmetrical and never moves upward in the
-       * lattice
+       * lattice. Which is to say it maintains the same knowledge or reduces knowledge
        */
-      final def merge(other: Contents): Contents = if (this eq other) this else (this, other) match {
+      final def union(other: Contents): Contents = if (this eq other) this else (this, other) match {
         case (Possible(possible1), Possible(possible2)) =>
           Possible(possible1 union possible2)
         case (Impossible(impossible1), Impossible(impossible2)) =>
@@ -150,6 +155,29 @@ abstract class ConstantOptimization extends SubComponent {
         case (Possible(possible), Impossible(impossible)) =>
           Impossible(impossible -- possible)
       }
+      /**
+       * Intersect this Contents with another providing additional information. union enforces
+       * the lattice structure. It is symmetrical and never moves downward in the
+       * lattice. Which is to say it maintains the same knowledge or increases knowledge
+       */
+      final def intersect(other: Contents): Contents = if (this eq other) this else (this, other) match {
+        case (Possible(possible1), Possible(possible2)) =>
+          Possible(possible1 intersect possible2)
+        case (Impossible(impossible1), Impossible(impossible2)) =>
+          Impossible(impossible1 union impossible2)
+        case (Impossible(impossible), Possible(possible)) =>
+          Impossible(possible -- impossible)
+        case (Possible(possible), Impossible(impossible)) =>
+          Impossible(possible -- impossible)
+      }
+      
+      /**
+       * Subtracts a set of possibilities the possibilities in this
+       * Contents. It is not symmetrical and never moves downward in the
+       * lattice. Which is to say it maintains the same knowledge or increases knowledge.
+       */
+      def removePossibilities(other: Set[Datum]): Contents
+      
       // TODO we could have more fine-grained knowledge, e.g. know that 0 < x < 3. But for now equality/inequality is a good start.
       def mightEqual(other: Contents): Boolean
       def mightNotEqual(other: Contents): Boolean
@@ -173,6 +201,8 @@ abstract class ConstantOptimization extends SubComponent {
         case Possible(possible2) => (possible -- possible2).nonEmpty || (possible2 -- possible).nonEmpty
         case Impossible(_) => true
       })
+      
+      def removePossibilities(other: Set[Datum]) = Possible(possible -- other)
     }
     private def SinglePossible(x: Datum) = new Possible(Set(x))
 
@@ -188,48 +218,57 @@ abstract class ConstantOptimization extends SubComponent {
         case Possible(_) => other mightNotEqual this
         case _ => true
       })
+      def removePossibilities(other: Set[Datum]) = Impossible(impossible ++ other)
     }
 
     /**
-     * Our entire knowledge about the contents of all variables and the stack. It forms
+     * Information about a single storable location (a variable or stack slot) including
+     * where it got its value and what its contents are
+     */
+    private case class Info(possibleSources: Set[SourceLocation], possibleCopyOf: Set[Local], contents: Contents) {
+      def union(other: Info) = if (this eq other) this else Info(possibleSources union other.possibleSources, possibleCopyOf union other.possibleCopyOf, contents union other.contents)
+    }
+    
+    /**
+     * Our entire knowledge about the info of all variables and the stack. It forms
      * a lattice primarily driven by the lattice structure of Contents.
      *
-     * In addition to the rules of contents, State has the following properties:
-     * - The merge of two sets of locals holds the merges of locals found in the intersection
+     * In addition to the rules of info, State has the following properties:
+     * - The union of two sets of locals holds the unions of locals found in the intersection
      * of the two sets of locals. Locals not found in a
      * locals map are thus possibly uninitialized and attempting to load them results
      * in an error.
-     * - The stack heights of two states must match otherwise it's an error to merge them
+     * - The stack heights of two states must match otherwise it's an error to union them
      *
      * State is immutable in order to aid in structure sharing of local maps and stacks
      */
-    private case class State(locals: Map[Local, Contents], stack: List[Contents]) {
-      def mergeLocals(olocals: Map[Local, Contents]): Map[Local, Contents] = if (locals eq olocals) locals else Map((for {
+    private case class State(locals: Map[Local, Info], stack: List[Info]) {
+      def unionLocals(olocals: Map[Local, Info]): Map[Local, Info] = if (locals eq olocals) locals else Map((for {
         key <- (locals.keySet intersect olocals.keySet).toSeq
-      } yield (key, locals(key) merge olocals(key))): _*)
+      } yield (key, locals(key) union olocals(key))): _*)
 
-      def merge(other: State): State = if (this eq other) this else {
-        @tailrec def mergeStacks(l: List[Contents], r: List[Contents], out: List[Contents]): List[Contents] = (l, r) match {
+      def union(other: State): State = if (this eq other) this else {
+        @tailrec def unionStacks(l: List[Info], r: List[Info], out: List[Info]): List[Info] = (l, r) match {
           case (Nil, Nil) => out.reverse
           case (l, r) if l eq r => out.reverse ++ l
-          case (lhead :: ltail, rhead :: rtail) => mergeStacks(ltail, rtail, (lhead merge rhead) :: out)
+          case (lhead :: ltail, rhead :: rtail) => unionStacks(ltail, rtail, (lhead union rhead) :: out)
           case _ => sys.error("Mismatched stack heights")
         }
 
-        val newLocals = mergeLocals(other.locals)
+        val newLocals = unionLocals(other.locals)
 
-        val newStack = if (stack eq other.stack) stack else mergeStacks(stack, other.stack, Nil)
+        val newStack = if (stack eq other.stack) stack else unionStacks(stack, other.stack, Nil)
         State(newLocals, newStack)
       }
 
       /**
        * Peek at the top of the stack without modifying it. Error if the stack is empty
        */
-      def peek(n: Int): Contents = stack(n)
+      def peek(n: Int): Info = stack(n)
       /**
-       * Push contents onto a stack
+       * Push info onto a stack
        */
-      def push(contents: Contents): State = this copy (stack = contents :: stack)
+      def push(info: Info): State = this copy (stack = info :: stack)
       /**
        * Drop n elements from the stack
        */
@@ -239,16 +278,17 @@ abstract class ConstantOptimization extends SubComponent {
        * is empty
        */
       def store(variable: Local): State = {
-        val contents = stack.head
-        val newVariables = locals + ((variable, contents))
+        val info = stack.head
+        val newVariables = locals + ((variable, info))
         new State(newVariables, stack.tail)
       }
       /**
        * Load the specified local onto the top of the stack. An error the the local is uninitialized.
        */
-      def load(variable: Local): State = {
-        val contents: Contents = locals.getOrElse(variable, sys.error(s"$variable is not initialized"))
-        push(contents)
+      def load(local: Local): State = {
+        val Info(source, copyOf, contents) = locals.getOrElse(local, sys.error(s"$local is not initialized"))
+        
+        push(Info(source, copyOf + local, contents))
       }
       /**
        * A copy of this State with an empty stack
@@ -258,10 +298,13 @@ abstract class ConstantOptimization extends SubComponent {
 
     // some precomputed constants
     private val NULL = Const(Constant(null: Any))
+    private val FALSE = Const(Constant(false))
+    private val TRUE = Const(Constant(true))
     private val UNKNOWN = Impossible(Set.empty)
     private val NOT_NULL = SingleImpossible(NULL)
+    private val TRUE_OR_FALSE = Possible(Set(TRUE, FALSE))
     private val CONST_UNIT = SinglePossible(Const(Constant(())))
-    private val CONST_FALSE = SinglePossible(Const(Constant(false)))
+    private val CONST_FALSE = SinglePossible(FALSE)
     private val CONST_ZERO_BYTE = SinglePossible(Const(Constant(0: Byte)))
     private val CONST_ZERO_SHORT = SinglePossible(Const(Constant(0: Short)))
     private val CONST_ZERO_CHAR = SinglePossible(Const(Constant(0: Char)))
@@ -290,15 +333,22 @@ abstract class ConstantOptimization extends SubComponent {
       case ConcatClass => abort("no zero of ConcatClass")
     }
 
+    /**
+     * produce a list drops of the specified kinds
+     */
+    private def drops(kinds: List[TypeKind]) = kinds map DROP
+    
     // normal locals can't be null, so we use null to mean the magic 'this' local
     private val THIS_LOCAL: Local = null
 
     /**
      * interpret a single instruction to find its impact on the abstract state
      */
-    private def interpretInst(in: State, inst: Instruction): State = {
+    private def interpretInst(in: State, inst: Instruction, block: BasicBlock, idx: Int): State = {
       // pop the consumed number of values off the `in` state's stack, producing a new state
       def dropConsumed: State = in drop inst.consumed
+      
+      def location = Set(SourceLocation(block, idx))
       
       inst match {
         case THIS(_) =>
@@ -308,10 +358,10 @@ abstract class ConstantOptimization extends SubComponent {
           // treat NaN as UNKNOWN because NaN must never equal NaN
           val const = if (k.isNaN) UNKNOWN
           else SinglePossible(Const(k))
-          in push const
+          in push Info(location, Set.empty, const)
   
         case LOAD_ARRAY_ITEM(_) | LOAD_FIELD(_, _) | CALL_PRIMITIVE(_) =>
-          dropConsumed push UNKNOWN
+          dropConsumed push Info(location, Set.empty, UNKNOWN)
 
         case LOAD_LOCAL(local) =>
           // TODO if a local is known to hold a constant then we can replace this instruction with a push of that constant
@@ -331,54 +381,43 @@ abstract class ConstantOptimization extends SubComponent {
           // We could turn nonConstantString.equals(constantString) into constantString.equals(nonConstantString)
           //  and eliminate the null check that likely precedes this call
           val initial = dropConsumed
-          (0 until inst.produced).foldLeft(initial) { case (know, _) => know push UNKNOWN }
+          (0 until inst.produced).foldLeft(initial) { case (know, _) => know push Info(location, Set.empty, UNKNOWN) }
   
         case BOX(_) =>
-          val value = in peek 0
-          // we simulate boxing by, um, boxing the possible/impossible contents
+          val info = in peek 0
+          // we simulate boxing by, um, boxing the possible/impossible info
           // so if we have Possible(1,2) originally then we'll end up with
-          // a Possible(Boxed(1), Boxed(2))
-          // Similarly, if we know the input is not a 0 then we'll know the
-          // output is not a Boxed(0)
-          val newValue = value match {
-            case Possible(values) => Possible(values map Boxed)
-            case Impossible(values) => Impossible(values map Boxed)
-          }
-          dropConsumed push newValue
+          // a Boxed(Possible(1, 2))
+          val newInfo = Info(location, Set.empty, SinglePossible(Boxed(info)))
+          dropConsumed push newInfo
   
         case UNBOX(_) =>
-          val value = in peek 0
-          val newValue = value match {
+          // hopefully we're unboxing a set of possible boxes created from BOX(_). But we might,
+          // so treat anything else as an unknown
+          val info = in peek 0
+          val Info(_, _, contents) = info
+          val newInfo: Info = contents match {
             // if we have a Possible, then all the possibilities
             // should themselves be Boxes. In that
-            // case we can merge them to figure out what the UNBOX will produce
+            // case we can union them to figure out what the UNBOX will produce
             case Possible(inners) =>
               assert(inners.nonEmpty, "Empty possible set indicating an uninitialized location")
-              val sanitized: Set[Contents] = (inners map {
-                case Boxed(content) => SinglePossible(content)
-                case _ => UNKNOWN
+              val sanitized: Set[Info] = (inners map {
+                case Boxed(content) => content
+                case _ => Info(location, Set.empty, UNKNOWN)
               })
-              sanitized reduce (_ merge _)
+              sanitized reduce (_ union _)
             // if we have an impossible then the thing that's impossible
             // should be a box. We'll unbox that to see what we get
-            case unknown@Impossible(inners) =>
-              if (inners.isEmpty) {
-                unknown
-              } else {
-                val sanitized: Set[Contents] = (inners map {
-                  case Boxed(content) => SingleImpossible(content)
-                  case _ => UNKNOWN
-                })
-                sanitized reduce (_ merge _)
-              }
+            case _ => Info(location, Set.empty, UNKNOWN)
           }
-          dropConsumed push newValue
+          dropConsumed push newInfo
   
         case LOAD_MODULE(_) | NEW(_) | LOAD_EXCEPTION(_) =>
-          in push NOT_NULL
+          in push Info(location, Set.empty, NOT_NULL)
 
         case CREATE_ARRAY(_, _) =>
-          dropConsumed push NOT_NULL
+          dropConsumed push Info(location, Set.empty, NOT_NULL)
     
         case IS_INSTANCE(_) =>
           // TODO IS_INSTANCE is going to be followed by a C(Z)JUMP
@@ -390,9 +429,7 @@ abstract class ConstantOptimization extends SubComponent {
           // replace with a constant false, but how often is a knowable null checked for instanceof?
           // TODO we could track type information and statically know to eliminate IS_INSTANCE
           // which might be a nice win under specialization
-          dropConsumed push UNKNOWN // it's actually a Possible(true, false) but since the following instruction
-        // will be a conditional jump comparing to true or false there
-        // nothing to be gained by being more precise
+          dropConsumed push Info(location, Set.empty, TRUE_OR_FALSE)
   
         case CHECK_CAST(_) =>
           // TODO we could track type information and statically know to eliminate CHECK_CAST
@@ -400,8 +437,8 @@ abstract class ConstantOptimization extends SubComponent {
           in
   
         case DUP(_) =>
-          val value = in peek 0
-          in push value
+          val info = in peek 0
+          in push info
   
         case DROP(_) | MONITOR_ENTER() | MONITOR_EXIT() | STORE_ARRAY_ITEM(_) | STORE_FIELD(_, _) =>
           dropConsumed
@@ -418,62 +455,88 @@ abstract class ConstantOptimization extends SubComponent {
      * It will result in a map from target blocks to the input state computed for that block. It
      * also computes a replacement list of instructions
      */
-    private def interpretLast(in: State, inst: Instruction): (Map[BasicBlock, State], List[Instruction]) = {
-      def canSwitch(in1: Contents, tagSet: List[Int]) = {
-        in1 mightEqual Possible(tagSet.toSet map { tag: Int => Const(Constant(tag)) })
+    private def interpretLast(in: State, inst: Instruction, block: BasicBlock, idx: Int): (Map[BasicBlock, State], List[Instruction]) = {
+      def canSwitch(in1: Info, tagSet: List[Int]) = {
+        in1.contents mightEqual Possible(tagSet.toSet map { tag: Int => Const(Constant(tag)) })
       }
 
       /**
        * common code for interpreting CJUMP and CZJUMP
        */
-      def interpretConditional(kind: TypeKind, val1: Contents, val2: Contents, success: BasicBlock, failure: BasicBlock, cond: TestOp): (Map[BasicBlock, State], List[Instruction]) = {
+      def interpretConditional(kind: TypeKind, val1: Info, val2: Info, success: BasicBlock, failure: BasicBlock, cond: TestOp): (Map[BasicBlock, State], List[Instruction]) = {
         // TODO use reaching analysis to update the state in the two branches
         // e.g. if the comparison was checking null equality on local x
         // then the in the success branch we know x is null and
         // on the failure branch we know it is not
         // in fact, with copy propagation we could propagate that knowledge
         // back through a chain of locations
-        //
-        // TODO if we do all that we need to be careful in the
-        // case that success and failure are the same target block
-        // because we're using a Map and don't want one possible state to clobber the other
-        // alternative mayb we should just replace the conditional with a jump if both targets are the same
-
-        def mightEqual = val1 mightEqual val2
-        def mightNotEqual = val1 mightNotEqual val2
-        def guaranteedEqual = mightEqual && !mightNotEqual
-
-        def succPossible = cond match {
-          case EQ => mightEqual
-          case NE => mightNotEqual
-          case LT | GT => !guaranteedEqual // if the two are guaranteed to be equal then they can't be LT/GT
-          case LE | GE => true
-        }
-
-        def failPossible = cond match {
-          case EQ => mightNotEqual
-          case NE => mightEqual
-          case LT | GT => true
-          case LE | GE => !guaranteedEqual // if the two are guaranteed to be equal then they must be LE/GE
-        }
-
         val out = in drop inst.consumed
-
-        var result = Map[BasicBlock, State]()
-        if (succPossible) {
-          result += ((success, out))
-        }
-
-        if (failPossible) {
-          result += ((failure, out))
-        }
-
-        val replacements = if (result.size == 1) List.fill(inst.consumed)(DROP(kind)) :+ JUMP(result.keySet.head)
-        else inst :: Nil
         
-        (result, replacements)
+        // if success and failure blocks are the same target, just jump there
+        // after dropping the args to the conditional
+        if (success == failure) {
+          (Map((success, out)), drops(inst.consumedTypes) :+ JUMP(success))
+        } else {
+          def mightEqual = val1.contents mightEqual val2.contents
+          def mightNotEqual = val1.contents mightNotEqual val2.contents
+          def guaranteedEqual = mightEqual && !mightNotEqual
+  
+          def successUpdater: Option[State => State] = cond match {
+            case EQ => if (mightEqual) Some(updateStateEq _) else None
+            case NE => if (mightNotEqual) Some(updateStateNe _) else None
+            case LT | GT => if (!guaranteedEqual) Some(updateStateNe _) else None // if the two are guaranteed to be equal then they can't be LT/GT
+            case LE | GE => Some(identity)
+          }
+  
+          def failUpdater: Option[State => State] = cond match {
+            case EQ => if (mightNotEqual) Some(updateStateNe _) else None
+            case NE => if (mightEqual) Some(updateStateEq) else None
+            case LT | GT => Some(identity)
+            case LE | GE => if(!guaranteedEqual) Some(updateStateNe _) else None // if the two are guaranteed to be equal then they must be LE/GE
+          }
+          
+          def updateStateEq(in: State): State = {
+            (val1, val2) match {
+              case (Info(source, copyOf, _), Info(_, _, contents)) =>
+                val possibleCopyInfo = copyOf map {local => (local, in.locals(local))} 
+                val copyInfo = possibleCopyInfo filter {case (local, info) => info.possibleSources == source}
+                // TODO clean up these variable names
+                val updateInfo = copyInfo map {case (local, Info(source, copyOf, contents2)) => (local, Info(source, copyOf, contents2 intersect contents))}
+                updateInfo.foldLeft(in){case (state, pair) => state.copy(locals = state.locals + pair)}
+              case _ =>
+                in
+            }
+          }
+    
+          def updateStateNe(in: State): State = {
+            (val1, val2) match {
+              case (Info(source, copyOf, _), Info(_, _, Possible(possibilities))) if possibilities.size == 1 =>
+                val possibleCopyInfo = copyOf map {local => (local, in.locals(local))} 
+                val copyInfo = possibleCopyInfo filter {case (local, info) => info.possibleSources == source}
+                val updateInfo = copyInfo map {case (local, Info(source, copyOf, contents2)) => (local, Info(source, copyOf, contents2 removePossibilities possibilities))}
+                updateInfo.foldLeft(in){case (state, pair) => state.copy(locals = state.locals + pair)}
+              case _ =>
+                in
+            }
+          }
+          
+          
+          var result = Map[BasicBlock, State]()
+          if (successUpdater.isDefined) {
+            result += ((success, successUpdater.get.apply(out)))
+          }
+  
+          if (failUpdater.isDefined) {
+            result += ((failure, failUpdater.get.apply(out)))
+          }
+  
+          val replacements = if (result.size == 1) drops(inst.consumedTypes) :+ JUMP(result.keySet.head)
+          else inst :: Nil
+          
+          (result, replacements)
+        }
       }
-
+      
       inst match {
         case JUMP(whereto) =>
           (Map((whereto, in)), inst :: Nil)
@@ -485,7 +548,7 @@ abstract class ConstantOptimization extends SubComponent {
 
         case CZJUMP(success, failure, cond, kind) =>
           val in1 = in peek 0
-          val in2 = getZeroOf(kind)
+          val in2 = Info(Set(SourceLocation(block, idx)), Set.empty, getZeroOf(kind))
           interpretConditional(kind, in1, in2, success, failure, cond)
 
         case SWITCH(tags, labels) =>
@@ -498,7 +561,7 @@ abstract class ConstantOptimization extends SubComponent {
             // see if the default is reachable by seeing if the input might be out of the set
             // of all tags
             val allTags = Possible(tags.flatten.toSet map { tag: Int => Const(Constant(tag)) })
-            if (in1 mightNotEqual allTags) {
+            if (in1.contents mightNotEqual allTags) {
               reachableNormalLabels :+ defaultLabel
             } else {
               reachableNormalLabels
@@ -508,7 +571,7 @@ abstract class ConstantOptimization extends SubComponent {
           }
           // TODO similar to the comment in interpretConditional, we should update our the State going into each
           // branch based on which tag is being matched. Also, just like interpretConditional, if target blocks
-          // are the same we need to merge State rather than clobber
+          // are the same we need to union State rather than clobber
 
           // alternative, maybe we should simplify the SWITCH to not have same target labels
           val newState = in drop inst.consumed
@@ -540,16 +603,16 @@ abstract class ConstantOptimization extends SubComponent {
       var idx = 0
       while (idx < normalCount) {
         val inst = block(idx)
-        normalExitState = interpretInst(normalExitState, inst)
+        normalExitState = interpretInst(normalExitState, inst, block, idx)
         if (normalExitState.locals ne exceptionState.locals)
-          exceptionState.copy(locals = exceptionState mergeLocals normalExitState.locals)
+          exceptionState.copy(locals = exceptionState unionLocals normalExitState.locals)
         idx += 1
       }
 
       val pairs = block.exceptionSuccessors map { b => (b, exceptionState) }
       val exceptionMap = Map(pairs: _*)
 
-      val (normalExitMap, newInstructions) = interpretLast(normalExitState, block.lastInstruction)
+      val (normalExitMap, newInstructions) = interpretLast(normalExitState, block.lastInstruction, block, normalCount)
 
       (normalExitMap, exceptionMap, newInstructions)
     }
@@ -564,9 +627,11 @@ abstract class ConstantOptimization extends SubComponent {
       var iterations = 0
 
       // initially we know that 'this' is not null and the params are initialized to some unknown value
-      val initThis: Iterator[(Local, Contents)] = if (m.isStatic) Iterator.empty else Iterator.single((THIS_LOCAL, NOT_NULL))
-      val initOtherLocals: Iterator[(Local, Contents)] = m.params.iterator map { param => (param, UNKNOWN) }
-      val initialLocals: Map[Local, Contents] = Map((initThis ++ initOtherLocals).toSeq: _*)
+      val startBlock = m.startBlock
+      val source: Set[SourceLocation] = Set(SourceLocation(startBlock, -1))
+      val initThis: Iterator[(Local, Info)] = if (m.isStatic) Iterator.empty else Iterator.single((THIS_LOCAL, Info(source, Set.empty, NOT_NULL)))
+      val initOtherLocals: Iterator[(Local, Info)] = m.params.iterator map { param => (param, Info(source, Set.empty, UNKNOWN)) }
+      val initialLocals: Map[Local, Info] = Map((initThis ++ initOtherLocals).toSeq: _*)
       val initialState = State(initialLocals, Nil)
 
       // worklist of basic blocks to process, initially the start block
@@ -578,7 +643,7 @@ abstract class ConstantOptimization extends SubComponent {
       val exceptionlist = MSet[BasicBlock]()
       // our current best guess at what the input state is for each block
       // initially we only know about the start block
-      val inputState = MMap[BasicBlock, State]((m.startBlock, initialState))
+      val inputState = MMap[BasicBlock, State]((startBlock, initialState))
 
       // update the inputState map based on new information from interpreting a block
       // When the input state of a block changes, add it back to the work list to be
@@ -586,7 +651,7 @@ abstract class ConstantOptimization extends SubComponent {
       def updateInputStates(outputStates: Map[BasicBlock, State], worklist: MSet[BasicBlock]) {
         for ((block, newState) <- outputStates) {
           val oldState = inputState get block
-          val updatedState = oldState map (x => x merge newState) getOrElse newState
+          val updatedState = oldState map (x => x union newState) getOrElse newState
           if (oldState != Some(updatedState)) {
             worklist add block
             inputState(block) = updatedState
