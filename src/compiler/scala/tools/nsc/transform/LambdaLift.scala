@@ -430,6 +430,13 @@ abstract class LambdaLift extends InfoTransform {
       liftedDefs(sym.owner) ::= tree
       sym.owner.info.decls enterUnique sym
       debuglog("lifted: " + sym + " from " + oldOwner + " to " + sym.owner)
+      tree match {
+        case DefDef(_, _, _, _, _, _) if (!(tree.symbol.isModule || tree.symbol.isLazy || tree.exists{
+          case This(_) => true
+          case _ => false
+        })) => tree.symbol.setFlag(STATIC)
+        case _ =>
+      }
       EmptyTree
     }
 

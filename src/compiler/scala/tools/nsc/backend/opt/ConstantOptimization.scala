@@ -247,7 +247,7 @@ abstract class ConstantOptimization extends SubComponent {
        * Load the specified local onto the top of the stack. An error the the local is uninitialized.
        */
       def load(variable: Local): State = {
-        val contents: Contents = locals.getOrElse(variable, sys.error(s"$variable is not initialized"))
+        val contents: Contents = locals.getOrElse(variable, sys.error(s"${if (variable == null) "this" else variable.toString} is not initialized"))
         push(contents)
       }
       /**
@@ -564,7 +564,7 @@ abstract class ConstantOptimization extends SubComponent {
       var iterations = 0
 
       // initially we know that 'this' is not null and the params are initialized to some unknown value
-      val initThis: Iterator[(Local, Contents)] = if (m.isStatic) Iterator.empty else Iterator.single((THIS_LOCAL, NOT_NULL))
+      val initThis: Iterator[(Local, Contents)] = Iterator.single((THIS_LOCAL, NOT_NULL))
       val initOtherLocals: Iterator[(Local, Contents)] = m.params.iterator map { param => (param, UNKNOWN) }
       val initialLocals: Map[Local, Contents] = Map((initThis ++ initOtherLocals).toSeq: _*)
       val initialState = State(initialLocals, Nil)
