@@ -322,7 +322,12 @@ abstract class LambdaLift extends InfoTransform {
         if (enclosure eq NoSymbol) throw new IllegalArgumentException("Could not find proxy for "+ sym.defString +" in "+ sym.ownerChain +" (currentOwner= "+ currentOwner +" )")
         debuglog("searching for " + sym + "(" + sym.owner + ") in " + enclosure + " " + enclosure.logicallyEnclosingMember)
 
-        val proxyName = proxyNames.getOrElse(sym, sym.name)
+        val proxyName =
+          // if enclosure is a function then we should bypass proxing at all
+          if (enclosure.isAnonymousFunction && !enclosure.isClass)
+            sym.name
+          else
+            proxyNames.getOrElse(sym, sym.name)
         val ps = (proxies get enclosure.logicallyEnclosingMember).toList.flatten find (_.name == proxyName)
         ps getOrElse searchIn(enclosure.skipConstructor.owner)
       }
