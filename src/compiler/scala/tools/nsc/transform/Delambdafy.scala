@@ -183,7 +183,8 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       val liftedMethodDef = {
         val additionalParams = (thisProxy.toList ++ captureProxies.values) map ValDef
         // method definition with the return type, and body as the original lambda, with the same arguments plus captured arguments
-        createMethod(clazz, tpnme.ANON_FUN_NAME.toTermName, additionalParams, STATIC | SYNTHETIC) {
+        val methodName = unit.freshTermName(tpnme.ANON_FUN_NAME.toTermName.decode)
+        createMethod(clazz, methodName, additionalParams, STATIC | SYNTHETIC) {
           case (methSym, vparams) =>
             fun.body.substituteSymbols(fun.vparams map (_.symbol), vparams map (_.symbol))
             fun.body changeOwner (fun.symbol -> methSym)
