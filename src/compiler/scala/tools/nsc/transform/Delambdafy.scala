@@ -252,9 +252,11 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
           args foreach {arg => declared += arg.symbol}
         case ValDef(_, _, _, _) =>
           declared += tree.symbol
+        case _: Bind =>
+          declared += tree.symbol
         case Ident(_) =>
           val sym = tree.symbol
-          if (sym.isLocal && sym.isTerm && !sym.isMethod && !declared.contains(sym)) freeVars += sym
+          if ((sym != NoSymbol) && sym.isLocal && sym.isTerm && !sym.isMethod && !declared.contains(sym)) freeVars += sym
         case _ =>
       }
       super.traverse(tree)
