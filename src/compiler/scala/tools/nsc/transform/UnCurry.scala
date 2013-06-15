@@ -233,42 +233,98 @@ abstract class UnCurry extends InfoTransform
 
       deEta(fun) match {
         // nullary or parameterless
-        case fun1 if fun1 ne fun => fun1
-        case _ if settings.Ydelambdafy.value == "inline" =>
-          val parents = addSerializable(abstractFunctionForFunctionType(fun.tpe))
-          val anonClass = fun.symbol.owner newAnonymousFunctionClass(fun.pos, inConstructorFlag) addAnnotation serialVersionUIDAnnotation
-          anonClass setInfo ClassInfoType(parents, newScope, anonClass)
-
+        case fun1 if fun1 ne fun => mainTransform(fun1)    
+        case _ =>
           val targs     = fun.tpe.typeArgs
           val (formals, restpe) = (targs.init, targs.last)
-
-          val applyMethodDef = {
-            val methSym = anonClass.newMethod(nme.apply, fun.pos, FINAL)
-            val paramSyms = map2(formals, fun.vparams) {
-              (tp, param) => methSym.newSyntheticValueParam(tp, param.name)
+          
+          /**
+           * Abstracts away the common functionality required to create both 
+           * the lifted function and the apply method on the anonymous class
+           * It creates a method definition with value params cloned from the
+           * original lambda. Then it calls a supplied function to create 
+           * the body and types the result. Finally 
+           * everything is wrapped up in a MethodDef
+           * 
+           * @param owner The owner for the new method
+           * @param name name for the new method
+           * @param additionalFlags flags to be put on the method in addition to FINAL
+           * @bodyF function that turns the method symbol and list of value params
+           *        into a body for the method
+           */
+          def createMethod(owner: Symbol, name: TermName, additionalFlags: Long)(bodyF: (Symbol, List[ValDef]) => Tree) = {
+            val methSym = owner.newMethod(name, fun.pos, FINAL | additionalFlags)
+            val vparams = fun.vparams map (_.duplicate)
+            
+            val paramSyms = map2(formals, vparams) {
+              (tp, vparam) => methSym.newSyntheticValueParam(tp, vparam.name)
             }
-            methSym setInfoAndEnter MethodType(paramSyms, restpe)
-
-            fun.vparams foreach  (_.symbol.owner =  methSym)
-            fun.body changeOwner (fun.symbol     -> methSym)
-
-            val body    = localTyper.typedPos(fun.pos)(fun.body)
-            val methDef = DefDef(methSym, List(fun.vparams), body)
+            vparams zip paramSyms foreach {case (valdef, sym) => valdef.symbol = sym}
+            vparams foreach (_.symbol.owner = methSym)
+            
+            val methodType = MethodType(paramSyms, restpe)
+            methSym setInfo methodType
+            
+            val body = localTyper.typedPos(fun.pos)(bodyF(methSym, vparams))
+            val methDef = DefDef(methSym, List(vparams), body)
 
             // Have to repack the type to avoid mismatches when existentials
             // appear in the result - see SI-4869.
             methDef.tpt setType localTyper.packedType(body, methSym)
             methDef
+            
           }
 
-          localTyper.typedPos(fun.pos) {
-            Block(
-              List(ClassDef(anonClass, NoMods, ListOfNil, List(applyMethodDef), fun.pos)),
-              Typed(New(anonClass.tpe), TypeTree(fun.tpe)))
+          val inline = settings.Ydelambdafy.value == "inline"
+          val funTyper = localTyper.typedPos(fun.pos) _
+
+          if (inline) {
+            // if delambdafy strategy is inline then 
+            // fall back to putting the body of the lambda directly in the anonymous class
+            // anonymous subclass of FunctionN with an apply method
+            val anonymousClassDef = {
+              val parents = addSerializable(abstractFunctionForFunctionType(fun.tpe))
+              val anonClass = fun.symbol.owner newAnonymousFunctionClass(fun.pos, inConstructorFlag) addAnnotation serialVersionUIDAnnotation
+              anonClass setInfo ClassInfoType(parents, newScope, anonClass)
+              // apply method with same arguments and return type as orignal lambda.
+              val applyMethodDef = createMethod(anonClass, nme.apply, 0) {
+                case (methSym, vparams) =>
+                  // stuff the lambda's body into the apply method
+                  fun.body.substituteSymbols(fun.vparams map (_.symbol), vparams map (_.symbol))
+                  fun.body changeOwner (fun.symbol -> methSym)                             
+              }
+              anonClass.info.decls enter applyMethodDef.symbol
+              ClassDef(anonClass, NoMods, ListOfNil, List(applyMethodDef), fun.pos)
+            }
+
+            mainTransform(funTyper {
+              Block(
+                List(anonymousClassDef),
+                Typed(New(anonymousClassDef.symbol), TypeTree(fun.tpe)))
+            })
+          } else {
+            val methodFlags = ARTIFACT
+            // method definition with the same arguments, return type, and body as the original lambda
+            val liftedMethod = createMethod(fun.symbol.owner, tpnme.ANON_FUN_NAME.toTermName, methodFlags){
+              case(methSym, vparams) => 
+                fun.body.substituteSymbols(fun.vparams map (_.symbol), vparams map (_.symbol))
+                fun.body changeOwner (fun.symbol -> methSym)
+            }
+            // callsite for the lifted method
+            val args = fun.vparams map {vparam => Ident(vparam.symbol)}
+            val liftedMethodCall = funTyper(Apply(liftedMethod.symbol, args:_*))
+            
+            // new function whose body is just a call to the lifted method
+            val newFun = fun.replace(fun.body, liftedMethodCall)
+            funTyper {
+              Block(
+                List(mainTransform(funTyper(liftedMethod))),
+                super.transform(newFun)
+              )
+            }
           }
-        // if Ydelambdafy isn't inline then we won't change the function now
-        case _ => fun
-      }
+
+        }
     }
 
     def transformArgs(pos: Position, fun: Symbol, args: List[Tree], formals: List[Type]) = {
@@ -515,11 +571,7 @@ abstract class UnCurry extends InfoTransform
             treeCopy.CaseDef(tree, pat1, transform(guard), transform(body))
 
           case fun @ Function(_, _) =>
-            val fun1 = transformFunction(fun)
-            if (fun1 ne fun)
-              mainTransform(fun1)
-            else
-              super.transform(fun1)
+            transformFunction(fun)
  
           case Template(_, _, _) =>
             withInConstructorFlag(0) { super.transform(tree) }

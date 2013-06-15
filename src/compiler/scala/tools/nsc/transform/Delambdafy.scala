@@ -25,31 +25,14 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
     new DelambdafyTransformer(unit)
 
   class DelambdafyTransformer(unit: CompilationUnit) extends TypingTransformer(unit) {
-    private val lambdaBodyDefs = new mutable.LinkedHashMap[Symbol, List[Tree]] withDefaultValue Nil
     private val lambdaClassDefs = new mutable.LinkedHashMap[Symbol, List[Tree]] withDefaultValue Nil
     
-
     override def transform(tree: Tree): Tree = tree match {
       case fun @ Function(_, _) => {
-        val (lambdaBodyDef, lambdaClassDef, newExpr) = transformFunction(fun)
-        val clazz = lambdaBodyDef.symbol.owner
-        val transformedLambdaBodyDef = this.transform(lambdaBodyDef)
-        lambdaBodyDefs(clazz) = transformedLambdaBodyDef :: lambdaBodyDefs(clazz)
-        val pkg = clazz.owner
-        
-        // create bridge on the apply method as needed
-        val eraser = erasure.newTransformer(unit)
-        val erasedLambdaClassDef = enteringPhase(currentRun.erasurePhase){
-          eraser.atOwner(lambdaClassDef.symbol)(eraser.transform(lambdaClassDef))
-        }
-        // erasure can leave behind some artifacts (like nonsense casts and
-        // "ErasedValueType") that post erasure cleans up
-        val postEraser = postErasure.newTransformer(unit)
-        val postErasedLambdaClassDef = enteringPhase(currentRun.posterasurePhase){
-          postEraser.atOwner(lambdaClassDef.symbol)(postEraser.transform(erasedLambdaClassDef))
-        }
-        
-        lambdaClassDefs(pkg) = postErasedLambdaClassDef :: lambdaClassDefs(pkg)
+        val (lambdaClassDef, newExpr) = transformFunction(fun)
+        val pkg = lambdaClassDef.symbol.owner
+               
+        lambdaClassDefs(pkg) = lambdaClassDef :: lambdaClassDefs(pkg)
         
         val transformedNewExpr = super.transform(newExpr)
         transformedNewExpr
@@ -59,67 +42,29 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
    
     /** Transform statements and add lifted definitions to them. */
     override def transformStats(stats: List[Tree], exprOwner: Symbol): List[Tree] = {
-      def addLambdaBodies(stat: Tree): Tree = stat match {
-        case ClassDef(_, _, _, _) =>
-          val lifted = lambdaBodyDefs get stat.symbol match {
-            case Some(xs) => xs reverseMap addLambdaBodies
-            case _        => Nil
-          }
-          try deriveClassDef(stat)(impl => deriveTemplate(impl)(_ ::: lifted))
-          finally lambdaBodyDefs -= stat.symbol
-        case _ =>
-          stat
-      }
-      (super.transformStats(stats, exprOwner) map addLambdaBodies) ++ {
-        val classDefs = lambdaClassDefs(exprOwner)
-        classDefs
-      }
+      super.transformStats(stats, exprOwner) ++ lambdaClassDefs(exprOwner)
     }
 
     override def transformUnit(unit: CompilationUnit) {
       afterOwnPhase {
         super.transformUnit(unit)
       }
-      assert(lambdaBodyDefs.isEmpty, lambdaBodyDefs.keys mkString ", ")
     }    
 
-    def transformFunction(fun0: Function): (DefDef, ClassDef, Apply) = {
-      val targs = fun0.tpe.typeArgs
+    def transformFunction(originalFunction: Function): (ClassDef, Apply) = {
+      val targs = originalFunction.tpe.typeArgs
       val (formals, restpe) = (targs.init, targs.last)
-      val clazz = fun0.symbol.enclClass
+      val oldClass = originalFunction.symbol.enclClass
       
       val freeVarsTraverser = new FreeVarTraverser
-      freeVarsTraverser.traverse(fun0)
+      freeVarsTraverser.traverse(originalFunction)
       val captures = freeVarsTraverser.freeVars
-      
-      val captureProxies = new LinkedHashMap[Symbol, TermSymbol]
-      captureProxies ++= (captures map {capture => 
-        val sym = fun0.symbol.owner.newVariable(capture.name.toTermName, capture.pos, 0)
-        sym setInfo capture.info
-        (capture, sym)
-      })
-
-      val decapturify = new DeCapturifyTransformer(captureProxies, unit, clazz, fun0.symbol.owner, fun0.symbol.pos)
-
-      val fun = decapturify.transform(fun0).asInstanceOf[Function]
-      val thisProxy = decapturify.thisProxy
 
       /**
-       * Abstracts away the common functionality required to create both
-       * the lifted function and the apply method on the anonymous class
-       * It creates a method definition with value params cloned from the
-       * original lambda. Then it calls a supplied function to create
-       * the body and types the result. Finally
-       * everything is wrapped up in a MethodDef
-       *
-       * @param owner The owner for the new method
-       * @param name name for the new method
-       * @param additionalFlags flags to be put on the method in addition to FINAL
-       * @bodyF function that turns the method symbol and list of value params
-       *        into a body for the method
+       * Creates the apply method for the anonymous subclass of FunctionN
        */
-      def createMethod(owner: Symbol, name: TermName, additionalParams: List[ValDef], additionalFlags: Long)(bodyF: (Symbol, List[ValDef]) => Tree): DefDef = {
-        val methSym = owner.newMethod(name, fun.pos, FINAL | additionalFlags)
+      def createApplyMethod(newClass: Symbol, fun: Function): DefDef = {
+        val methSym = newClass.newMethod(nme.apply, fun.pos, FINAL | SYNTHETIC)
         val originalParams = fun.vparams map (_.duplicate)
 
         val paramSyms = map2(formals, originalParams) {
@@ -127,17 +72,26 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         }
         originalParams zip paramSyms foreach { case (valdef, sym) => valdef.symbol = sym }
         originalParams foreach (_.symbol.owner = methSym)
-
-        additionalParams foreach(_.symbol.owner = methSym)
-        val additionalTypes = additionalParams map (_.symbol)
         
-        val methodType = MethodType(additionalTypes ++ paramSyms, restpe)
+        val methodType = MethodType(paramSyms, restpe)
         methSym setInfo methodType
       
-        owner.info.decls enter methSym
+        newClass.info.decls enter methSym
+
+        // the apply method needs to call the lifted method so that lifted method cannot be private
+        fun.body match {
+          case Apply(meth, _) => 
+            meth.symbol resetFlag PRIVATE
+            meth.symbol setFlag PROTECTED
+          case huh => 
+            error(s"expected a function body consisting only of a method application but got $huh")
+        }
         
-        val body = localTyper.typed(bodyF(methSym, originalParams) setPos fun.pos)
-        val vparams = additionalParams ++ originalParams
+        val vparams = originalParams
+        val body = localTyper.typed {
+            fun.body.substituteSymbols(fun.vparams map (_.symbol), vparams map (_.symbol))
+            fun.body changeOwner (fun.symbol -> methSym)
+        } setPos fun.pos
         val methDef = DefDef(methSym, List(vparams), body)
 
         // Have to repack the type to avoid mismatches when existentials
@@ -145,99 +99,135 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         // TODO probably don't need packedType
         methDef.tpt setType localTyper.packedType(body, methSym)
         methDef
+      }
+      
+      def createBridgeMethod(newClass:Symbol, applyMethod: DefDef): Option[DefDef] = {
+        def box(tree: Tree, treeTpe: Type): (Tree, Type) = treeTpe.typeSymbol match {
+	      case UnitClass  => (BLOCK(tree, REF(BoxedUnit_UNIT)), BoxedUnitClass.toType)
+	      case NothingClass => (tree, ObjectClass.tpe)
+	      case x =>
+            val newTree = (REF(boxMethod.apply(x)) APPLY tree) setPos (tree.pos)
+            val newType = boxedClass(x).toType
+            (newTree, newType)
+        }
+        
+        def unbox(tree: Tree, expectedTpe: Type): Tree = (REF(unboxMethod(expectedTpe.typeSymbol)) APPLY tree) setPos (tree.pos)
+        
+        def adapt(tree: Tree, treeTpe: Type, expectedType: Type): (Boolean, Tree) = {
+          if (treeTpe <:< expectedType) (false, tree)
+          else if (isPrimitiveValueType(treeTpe) && !isPrimitiveValueType(expectedType)) {
+            val (boxingTree, boxedType) = box(tree, treeTpe)
+            (true, adapt(boxingTree, boxedType, expectedType)._2)
+          } else if (isPrimitiveValueType(expectedType) && !isPrimitiveValueType(treeTpe)) (true, unbox(tree, expectedType))          
+          else (true, gen.mkAttributedCast(tree, expectedType))
+        }
+        val methSym = newClass.newMethod(nme.apply, applyMethod.pos, FINAL | SYNTHETIC | BRIDGE)
+        val originalParams = applyMethod.vparamss(0)
+        val bridgeParams = originalParams map { originalParam =>
+          val bridgeSym = methSym.newSyntheticValueParam(ObjectClass.tpe, originalParam.name)
+          bridgeSym.owner = methSym
+          ValDef(bridgeSym)
+        }
+        
+        val bridgeSyms = bridgeParams map (_.symbol)
 
+        val methodType = MethodType(bridgeSyms, ObjectClass.tpe)
+        methSym setInfo methodType
+        
+        val (neededParams, adaptedParams) = (bridgeSyms zip originalParams map {case (bridgeSym, originalParam) => adapt(Ident(bridgeSym), bridgeSym.tpe, originalParam.symbol.tpe)}).unzip
+        val body = Apply(Select(gen.mkAttributedThis(newClass), applyMethod.symbol), adaptedParams)
+        val (neededReturn, adaptedBody) = adapt(body, restpe, ObjectClass.tpe)
+        if (neededParams contains true || neededReturn) {
+          val methDef = (localTyper typed DefDef(methSym, List(bridgeParams), adaptedBody)).asInstanceOf[DefDef]
+          newClass.info.decls enter methSym
+          Some(methDef)
+        } else None
       }
 
-      def createConstructor(clazz: Symbol, members: List[ValDef]): DefDef = {
-        val constrSym = clazz.newConstructor(fun.pos, SYNTHETIC)
+      def createConstructor(newClass: Symbol, members: List[ValDef]): DefDef = {
+        val constrSym = newClass.newConstructor(originalFunction.pos, SYNTHETIC)
         
         val (paramTypes, params, assigns) = (members map {member => 
           val paramType = member.symbol.info.typeSymbol
-          val paramSymbol = clazz.newVariable(member.symbol.name.toTermName, clazz.pos, 0)
+          val paramSymbol = newClass.newVariable(member.symbol.name.toTermName, newClass.pos, 0)
           paramSymbol.setInfo(member.symbol.info)
           val paramVal = ValDef(paramSymbol)
           val paramIdent = Ident(paramSymbol)
-          val assign = Assign(Select(gen.mkAttributedQualifier(clazz.thisType), member.symbol), paramIdent)
+          val assign = Assign(Select(gen.mkAttributedThis(newClass), member.symbol), paramIdent)
           
           (paramType, paramVal, assign)
         }).unzip3
         
-        val constrType = MethodType(paramTypes, clazz.thisType)
+        val constrType = MethodType(paramTypes, newClass.thisType)
         constrSym setInfo constrType
 
-        clazz.info.decls enter constrSym
+        newClass.info.decls enter constrSym
         
         val body =
           Block(
             List(
-              Apply(Select(Super(gen.mkAttributedThis(clazz), tpnme.EMPTY) setPos clazz.pos, nme.CONSTRUCTOR) setPos clazz.pos, Nil) setPos clazz.pos
+              Apply(Select(Super(gen.mkAttributedThis(newClass), tpnme.EMPTY) setPos newClass.pos, nme.CONSTRUCTOR) setPos newClass.pos, Nil) setPos newClass.pos
             ) ++ assigns,
             Literal(Constant(())): Tree
-          ) setPos clazz.pos
+          ) setPos newClass.pos
         
-        localTyper.typed(DefDef(constrSym, List(params), body) setPos clazz.pos).asInstanceOf[DefDef]
+        (localTyper typed DefDef(constrSym, List(params), body) setPos newClass.pos).asInstanceOf[DefDef]
       }
       
-      val pkg = clazz.owner
-
-      val liftedMethodDef = {
-        val additionalParams = (thisProxy.toList ++ captureProxies.values) map ValDef
-        // method definition with the return type, and body as the original lambda, with the same arguments plus captured arguments
-        val methodName = unit.freshTermName(tpnme.ANON_FUN_NAME.toTermName.decode)
-        createMethod(clazz, methodName, additionalParams, STATIC | SYNTHETIC) {
-          case (methSym, vparams) =>
-            fun.body.substituteSymbols(fun.vparams map (_.symbol), vparams map (_.symbol))
-            fun.body changeOwner (fun.symbol -> methSym)
-        }
-      }
+      val pkg = oldClass.owner
 
       // anonymous subclass of FunctionN with an apply method
-      val anonymousClassDef = {
-        val parents = addSerializable(abstractFunctionForFunctionType(fun.tpe))
+      val (anonymousClassDef, thisProxy) = {
+        val parents = addSerializable(abstractFunctionForFunctionType(originalFunction.tpe))
         // TODO add serialuid
-        val name = unit.freshTypeName(clazz.name.decode + tpnme.ANON_FUN_NAME.decode)
+        val name = unit.freshTypeName(oldClass.name.decode + tpnme.ANON_FUN_NAME.decode)
         
-        val anonClass = pkg newClassSymbol(name, fun.pos, FINAL | SYNTHETIC) addAnnotation serialVersionUIDAnnotation
+        val anonClass = pkg newClassSymbol(name, originalFunction.pos, FINAL | SYNTHETIC) addAnnotation serialVersionUIDAnnotation
         anonClass setInfo ClassInfoType(parents, newScope, anonClass)
         
-        val members = (thisProxy.toList ++ captures) map {member =>
-          val newSymbol = anonClass.newValue(member.name.toTermName, fun.pos, /*PRIVATE | */SYNTHETIC)
-          newSymbol.info = member.tpe
-          anonClass.info.decls enter newSymbol
-          // TODO use mkzero or whatever instead of EmptyTree
-          ValDef(newSymbol, localTyper.typed(EmptyTree, member.tpe)) setPos fun.pos
+	    val captureProxies2 = new LinkedHashMap[Symbol, TermSymbol]
+	    captureProxies2 ++= (captures map {capture => 
+	      val sym = anonClass.newVariable(capture.name.toTermName, capture.pos, SYNTHETIC) // TODO PRIVATE
+	      sym setInfo capture.info
+	      (capture, sym)
+	    })
+	
+	    val decapturify = new DeCapturifyTransformer(captureProxies2, unit, oldClass, anonClass, originalFunction.symbol.pos)
+	
+	    val fun = decapturify.transform(originalFunction).asInstanceOf[Function]
+	    val thisProxy = decapturify.thisProxy
+        
+        val members = (thisProxy.toList ++ (captureProxies2 map (_._2))) map {member =>
+          anonClass.info.decls enter member
+          ValDef(member, gen.mkZero(member.tpe)) setPos fun.pos
         }
         
         // constructor
         val constr = createConstructor(anonClass, members)
         
         // apply method with same arguments and return type as original lambda.
-        val applyMethodDef = createMethod(anonClass, nme.apply, Nil, FINAL | SYNTHETIC) {
-          case (methSym, vparams) =>
-            val memberIdents = members map {member => Select(gen.mkAttributedThis(anonClass), member.symbol)}
-            val args = memberIdents ++ (vparams map { vparam => Ident(vparam.symbol) })
-            val select = Select(gen.mkAttributedQualifier(clazz.thisType) setPos fun.pos, liftedMethodDef.symbol) setPos fun.pos setType liftedMethodDef.tpe
-            Apply(select.symbol, args: _*) setPos fun.pos
-        }
+        val applyMethodDef = createApplyMethod(anonClass, fun)
         
-        val template = Template(anonClass.info.parents map TypeTree, emptyValDef, members ++ List(constr, applyMethodDef)) setPos fun.pos
+        val bridgeMethod = createBridgeMethod(anonClass, applyMethodDef)
+        
+        val template = Template(anonClass.info.parents map TypeTree, emptyValDef, members ++ List(constr, applyMethodDef) ++ bridgeMethod) setPos fun.pos
         
         // TODO if member fields are private this complains that they're not accessible
-        localTyper.typed(ClassDef(anonClass, template) setPos fun.pos).asInstanceOf[ClassDef]
+        (localTyper.typed(ClassDef(anonClass, template) setPos fun.pos).asInstanceOf[ClassDef], thisProxy)
       }
       
       pkg.info.decls enter anonymousClassDef.symbol
       
-      val thisArg = thisProxy.toList map (_ => gen.mkAttributedThis(clazz) setPos fun.pos)
-      val captureArgs = captures map (capture => Ident(capture) setPos fun.pos)
+      val thisArg = thisProxy.toList map (_ => gen.mkAttributedThis(oldClass) setPos originalFunction.pos)
+      val captureArgs = captures map (capture => Ident(capture) setPos originalFunction.pos)
 
       val newStat = 
-          New(anonymousClassDef.symbol, (thisArg ++ captureArgs): _*) setPos fun.pos
+          New(anonymousClassDef.symbol, (thisArg ++ captureArgs): _*) setPos originalFunction.pos
 
       val typedNewStat = 
-          localTyper.typed(newStat, functionType(fun.tpe.typeArgs.init, fun.tpe.typeArgs.last)).asInstanceOf[Apply]
+          localTyper.typed(newStat).asInstanceOf[Apply]
 
-      (liftedMethodDef, anonymousClassDef, typedNewStat)
+      (anonymousClassDef, typedNewStat)
     }
   } // DelambdafyTransformer
   
@@ -263,18 +253,18 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
     }
   }
   
-  class DeCapturifyTransformer(captureProxies: Map[Symbol, TermSymbol], unit: CompilationUnit, clazz: Symbol, owner:Symbol, pos: Position) extends TypingTransformer(unit) {
+  class DeCapturifyTransformer(captureProxies: Map[Symbol, TermSymbol], unit: CompilationUnit, oldClass: Symbol, newClass:Symbol, pos: Position) extends TypingTransformer(unit) {
     var thisProxy: Option[Symbol] = None
 
     override def transform(tree: Tree) = tree match {
-      case This(encl) if encl == clazz.name => if (thisProxy == None) {
-          val sym = owner.newVariable(nme.FAKE_LOCAL_THIS, pos, 0)
-          sym.info = clazz.tpe
+      case This(encl) if encl == oldClass.name => if (thisProxy == None) {
+          val sym = newClass.newVariable(nme.FAKE_LOCAL_THIS, pos, SYNTHETIC) // TODO PRIVATE
+          sym.info = oldClass.tpe
           thisProxy = Some(sym)
         }
-        localTyper typed Ident(thisProxy.get)
+        localTyper typed Select(gen.mkAttributedThis(newClass), thisProxy.get)
       case Ident(name) if (captureProxies contains tree.symbol) => 
-        localTyper typed Ident(captureProxies(tree.symbol))
+        localTyper typed Select(gen.mkAttributedThis(newClass), captureProxies(tree.symbol))
       case _ => super.transform(tree)
     }
   }
