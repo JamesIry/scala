@@ -257,7 +257,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
     var thisProxy: Option[Symbol] = None
 
     override def transform(tree: Tree) = tree match {
-      case This(encl) if encl == oldClass.name => if (thisProxy == None) {
+      case tree@This(encl) if tree.symbol == oldClass  => if (thisProxy == None) {
           val sym = newClass.newVariable(nme.FAKE_LOCAL_THIS, pos, SYNTHETIC) // TODO PRIVATE
           sym.info = oldClass.tpe
           thisProxy = Some(sym)
