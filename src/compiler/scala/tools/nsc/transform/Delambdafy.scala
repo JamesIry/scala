@@ -51,7 +51,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       }
     }    
 
-    def transformFunction(originalFunction: Function): (ClassDef, Apply) = {
+    def transformFunction(originalFunction: Function): (ClassDef, Tree) = {
       val targs = originalFunction.tpe.typeArgs
       val (formals, restpe) = (targs.init, targs.last)
       val oldClass = originalFunction.symbol.enclClass
@@ -175,10 +175,23 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       }
       
       val pkg = oldClass.owner
+      
+      /** Parent for anonymous class def */
+      val abstractFunctionErasedType = {
+        val originalFunctionTpe = originalFunction.tpe 
+        val functionArity = originalFunctionTpe.typeArgs.init.length
+        val abstractFunctionClass = AbstractFunctionClass(functionArity)
+        val tpe = abstractFunctionClass.tpe
+        // alternatively
+        //assert(abstractFunctionClass.owner.isPackageClass)
+        //val tpe2 = typeRef(abstractFunctionClass.owner.tpe, abstractFunctionClass, Nil)
+        tpe
+        //abstractFunctionForFunctionType(originalFunction.tpe)
+      }
 
       // anonymous subclass of FunctionN with an apply method
       val (anonymousClassDef, thisProxy) = {
-        val parents = addSerializable(abstractFunctionForFunctionType(originalFunction.tpe))
+        val parents = addSerializable(abstractFunctionErasedType)
         // TODO add serialuid
         val name = unit.freshTypeName(oldClass.name.decode + tpnme.ANON_FUN_NAME.decode)
         
@@ -222,10 +235,10 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       val captureArgs = captures map (capture => Ident(capture) setPos originalFunction.pos)
 
       val newStat = 
-          New(anonymousClassDef.symbol, (thisArg ++ captureArgs): _*) setPos originalFunction.pos
+          Typed(New(anonymousClassDef.symbol, (thisArg ++ captureArgs): _*) setPos originalFunction.pos, TypeTree(abstractFunctionErasedType))
 
       val typedNewStat = 
-          localTyper.typed(newStat).asInstanceOf[Apply]
+          localTyper.typed(newStat)
 
       (anonymousClassDef, typedNewStat)
     }
