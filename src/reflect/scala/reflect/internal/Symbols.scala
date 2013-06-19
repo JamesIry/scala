@@ -1997,7 +1997,7 @@ trait Symbols extends api.Symbols { self: SymbolTable =>
      */
     def logicallyEnclosingMember: Symbol =
       if (isLocalDummy) enclClass.primaryConstructor
-      else if (isMethod || isClass || isAnonymousFunction) this
+      else if (isMethod || isClass) this
       else owner.logicallyEnclosingMember
 
     /** Kept for source compatibility with 2.9. Scala IDE for Eclipse relies on this. */
