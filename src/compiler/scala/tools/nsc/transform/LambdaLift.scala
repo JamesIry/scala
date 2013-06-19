@@ -156,8 +156,7 @@ abstract class LambdaLift extends InfoTransform {
           val ss = symSet(free, enclosure)
           if (!ss(sym)) {
             ss += sym
-            if (!(enclosure.isAnonymousFunction && !enclosure.isClass))
-              renamable += sym
+            renamable += sym
             changedFreeVars = true
             debuglog("" + sym + " is free in " + enclosure)
             if (sym.isVariable) sym setFlag CAPTURED
@@ -303,11 +302,7 @@ abstract class LambdaLift extends InfoTransform {
           val newFlags = SYNTHETIC | ( if (owner.isClass) PARAMACCESSOR | PrivateLocal else PARAM )
           debuglog("free var proxy: %s, %s".format(owner.fullLocationString, freeValues.toList.mkString(", ")))
           proxies(owner) =
-            if (owner.isAnonymousFunction && !owner.isClass) {
-              // we don't want to proxy free variables in unexpanded anonymous functions here, we'll do that later in delambdafy
-              // (doing it here would create the confusing situation where a free variable have no binding anywhere)
-              freeValues.toList
-            } else for (fv <- freeValues.toList) yield {
+            for (fv <- freeValues.toList) yield {
               val proxyName = proxyNames.getOrElse(fv, fv.name)
               val proxy = owner.newValue(proxyName.toTermName, owner.pos, newFlags.toLong) setInfo fv.info
               if (owner.isClass) owner.info.decls enter proxy
@@ -322,12 +317,7 @@ abstract class LambdaLift extends InfoTransform {
         if (enclosure eq NoSymbol) throw new IllegalArgumentException("Could not find proxy for "+ sym.defString +" in "+ sym.ownerChain +" (currentOwner= "+ currentOwner +" )")
         debuglog("searching for " + sym + "(" + sym.owner + ") in " + enclosure + " " + enclosure.logicallyEnclosingMember)
 
-        val proxyName =
-          // if enclosure is a function then we should bypass proxing at all
-          if (enclosure.isAnonymousFunction && !enclosure.isClass)
-            sym.name
-          else
-            proxyNames.getOrElse(sym, sym.name)
+        val proxyName = proxyNames.getOrElse(sym, sym.name)
         val ps = (proxies get enclosure.logicallyEnclosingMember).toList.flatten find (_.name == proxyName)
         ps getOrElse searchIn(enclosure.skipConstructor.owner)
       }
@@ -386,9 +376,6 @@ abstract class LambdaLift extends InfoTransform {
       case Some(ps) =>
         val freeParams = ps map (p => ValDef(p) setPos tree.pos setType NoType)
         tree match {
-          case Function(_, _) =>
-            // attach the free symbols to the function for later transformation in delambdafy
-            tree.updateAttachment(ps)
           case DefDef(_, _, _, vparams :: _, _, _) =>
             val addParams = cloneSymbols(ps).map(_.setFlag(PARAM))
             sym.updateInfo(
@@ -463,8 +450,6 @@ abstract class LambdaLift extends InfoTransform {
     private def postTransform(tree: Tree, isBoxedRef: Boolean = false): Tree = {
       val sym = tree.symbol
       tree match {
-        case Function(_, _) =>
-          addFreeParams(tree, sym)
         case ClassDef(_, _, _, _) =>
           val tree1 = addFreeParams(tree, sym)
           if (sym.isLocal) liftDef(tree1) else tree1
