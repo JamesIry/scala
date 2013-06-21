@@ -114,7 +114,8 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         def unbox(tree: Tree, expectedTpe: Type): Tree = (REF(unboxMethod(expectedTpe.typeSymbol)) APPLY tree) setPos (tree.pos)
         
         def adapt(tree: Tree, treeTpe: Type, expectedType: Type): (Boolean, Tree) = {
-          if (treeTpe <:< expectedType) (false, tree)
+          if (treeTpe =:= expectedType) (false, tree)
+          else if (treeTpe <:< expectedType) (true, tree)
           else if (isPrimitiveValueType(treeTpe) && !isPrimitiveValueType(expectedType)) {
             val (boxingTree, boxedType) = box(tree, treeTpe)
             (true, adapt(boxingTree, boxedType, expectedType)._2)
