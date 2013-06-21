@@ -137,7 +137,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         val (neededParams, adaptedParams) = (bridgeSyms zip originalParams map {case (bridgeSym, originalParam) => adapt(Ident(bridgeSym), bridgeSym.tpe, originalParam.symbol.tpe)}).unzip
         val body = Apply(Select(gen.mkAttributedThis(newClass), applyMethod.symbol), adaptedParams)
         val (neededReturn, adaptedBody) = adapt(body, restpe, ObjectClass.tpe)
-        if (neededParams contains true || neededReturn) {
+        if (neededParams.contains(true) || neededReturn) {
           val methDef = (localTyper typed DefDef(methSym, List(bridgeParams), adaptedBody)).asInstanceOf[DefDef]
           newClass.info.decls enter methSym
           Some(methDef)
