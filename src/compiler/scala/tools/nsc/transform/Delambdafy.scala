@@ -52,7 +52,8 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
     }    
 
     def transformFunction(originalFunction: Function): (ClassDef, Tree) = {
-      val targs = originalFunction.tpe.typeArgs
+      val functionTpe = originalFunction.tpe 
+      val targs = functionTpe.typeArgs
       val (formals, restpe) = (targs.init, targs.last)
       val oldClass = originalFunction.symbol.enclClass
       
@@ -100,50 +101,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         methDef.tpt setType localTyper.packedType(body, methSym)
         methDef
       }
-      
-      def createBridgeMethod(newClass:Symbol, applyMethod: DefDef): Option[DefDef] = {
-        def box(tree: Tree, treeTpe: Type): (Tree, Type) = treeTpe.typeSymbol match {
-	      case UnitClass  => (BLOCK(tree, REF(BoxedUnit_UNIT)), BoxedUnitClass.toType)
-	      case NothingClass => (tree, ObjectClass.tpe)
-	      case x =>
-            val newTree = (REF(boxMethod.apply(x)) APPLY tree) setPos (tree.pos)
-            val newType = boxedClass(x).toType
-            (newTree, newType)
-        }
-        
-        def unbox(tree: Tree, expectedTpe: Type): Tree = (REF(unboxMethod(expectedTpe.typeSymbol)) APPLY tree) setPos (tree.pos)
-        
-        def adapt(tree: Tree, treeTpe: Type, expectedType: Type): (Boolean, Tree) = {
-          if (treeTpe =:= expectedType) (false, tree)
-          else if (treeTpe <:< expectedType) (true, tree)
-          else if (isPrimitiveValueType(treeTpe) && !isPrimitiveValueType(expectedType)) {
-            val (boxingTree, boxedType) = box(tree, treeTpe)
-            (true, adapt(boxingTree, boxedType, expectedType)._2)
-          } else if (isPrimitiveValueType(expectedType) && !isPrimitiveValueType(treeTpe)) (true, unbox(tree, expectedType))          
-          else (true, gen.mkAttributedCast(tree, expectedType))
-        }
-        val methSym = newClass.newMethod(nme.apply, applyMethod.pos, FINAL | SYNTHETIC | BRIDGE)
-        val originalParams = applyMethod.vparamss(0)
-        val bridgeParams = originalParams map { originalParam =>
-          val bridgeSym = methSym.newSyntheticValueParam(ObjectClass.tpe, originalParam.name)
-          bridgeSym.owner = methSym
-          ValDef(bridgeSym)
-        }
-        
-        val bridgeSyms = bridgeParams map (_.symbol)
 
-        val methodType = MethodType(bridgeSyms, ObjectClass.tpe)
-        methSym setInfo methodType
-        
-        val (neededParams, adaptedParams) = (bridgeSyms zip originalParams map {case (bridgeSym, originalParam) => adapt(Ident(bridgeSym), bridgeSym.tpe, originalParam.symbol.tpe)}).unzip
-        val body = Apply(Select(gen.mkAttributedThis(newClass), applyMethod.symbol), adaptedParams)
-        val (neededReturn, adaptedBody) = adapt(body, restpe, ObjectClass.tpe)
-        if (neededParams.contains(true) || neededReturn) {
-          val methDef = (localTyper typed DefDef(methSym, List(bridgeParams), adaptedBody)).asInstanceOf[DefDef]
-          newClass.info.decls enter methSym
-          Some(methDef)
-        } else None
-      }
 
       def createConstructor(newClass: Symbol, members: List[ValDef]): DefDef = {
         val constrSym = newClass.newConstructor(originalFunction.pos, SYNTHETIC)
@@ -221,7 +179,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         // apply method with same arguments and return type as original lambda.
         val applyMethodDef = createApplyMethod(anonClass, fun)
         
-        val bridgeMethod = createBridgeMethod(anonClass, applyMethodDef)
+        val bridgeMethod = createBridgeMethod(anonClass, originalFunction, applyMethodDef)
         
         val template = Template(anonClass.info.parents map TypeTree, emptyValDef, members ++ List(constr, applyMethodDef) ++ bridgeMethod) setPos fun.pos
         
@@ -242,8 +200,82 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
 
       (anonymousClassDef, typedNewStat)
     }
+    
+    def createBridgeMethod(newClass:Symbol, originalFunction: Function, applyMethod: DefDef): Option[DefDef] = {
+        def box(tree: Tree, treeTpe: Type): (Tree, Type) = treeTpe match {
+          case ErasedValueType(tref) =>
+            val clazz = tref.sym
+            val newTree = New(clazz, tree)
+            (newTree, clazz.tpe)
+          case _ => treeTpe.typeSymbol match {
+	        case UnitClass  => (BLOCK(tree, REF(BoxedUnit_UNIT)), BoxedUnitClass.toType)
+	        case NothingClass => (tree, ObjectClass.tpe)
+	        case x =>
+              val newTree = (REF(boxMethod.apply(x)) APPLY tree) setPos (tree.pos)
+              val newType = boxedClass(x).toType
+              (newTree, newType)
+          }
+        }
+        
+        def unbox(tree: Tree, treeType: Type, expectedTpe: Type): Tree = expectedTpe match {
+          case ErasedValueType(tref) =>
+            val clazz = tref.sym
+            log("not boxed: "+tree)
+            Apply(Select(adapt(tree, treeType, clazz.tpe)._2, clazz.derivedValueClassUnbox), List())
+          case _ =>
+            (REF(unboxMethod(expectedTpe.typeSymbol)) APPLY tree) setPos (tree.pos)
+        }
+        
+        def isErasedValueType(tpe: Type) = tpe.isInstanceOf[ErasedValueType]
+        def isDifferentErasedValueType(tpe: Type, other: Type) =
+          isErasedValueType(tpe) && (tpe ne other)
+
+        def adapt(tree: Tree, treeTpe: Type, expectedType: Type): (Boolean, Tree) = {
+          if (treeTpe =:= expectedType) (false, tree)
+          else if (isDifferentErasedValueType(treeTpe, expectedType)) {
+            val (newTree, newType) = box(tree, treeTpe)
+            (true, adapt(newTree, newType, expectedType)_2)
+          }
+          else if (isDifferentErasedValueType(expectedType, treeTpe)) (true, unbox(tree, treeTpe, expectedType))
+          else if (treeTpe <:< expectedType) (true, tree)
+          else if (isPrimitiveValueType(treeTpe) && !isPrimitiveValueType(expectedType)) {
+            val (boxingTree, boxedType) = box(tree, treeTpe)
+            (true, adapt(boxingTree, boxedType, expectedType)._2)
+          } else if (isPrimitiveValueType(expectedType) && !isPrimitiveValueType(treeTpe)) (true, unbox(tree, treeTpe, expectedType))          
+          else (true, gen.mkAttributedCast(tree, expectedType))
+        }
+        val methSym = newClass.newMethod(nme.apply, applyMethod.pos, FINAL | SYNTHETIC | BRIDGE)
+        val originalParams = applyMethod.vparamss(0)
+        val bridgeParams = originalParams map { originalParam =>
+          val bridgeSym = methSym.newSyntheticValueParam(ObjectClass.tpe, originalParam.name)
+          bridgeSym.owner = methSym
+          ValDef(bridgeSym)
+        }
+        
+        val bridgeSyms = bridgeParams map (_.symbol)
+
+        val methodType = MethodType(bridgeSyms, ObjectClass.tpe)
+        methSym setInfo methodType
+        
+        enteringPhase(currentRun.posterasurePhase) {
+	      val liftedBodyDefTpe: MethodType = {
+	        val liftedBodySymbol = {
+	          val Apply(method, _) = originalFunction.body
+	          method.symbol
+	        }
+	        liftedBodySymbol.info.asInstanceOf[MethodType]
+	      }
+          val (neededParams, adaptedParams) = (bridgeSyms zip liftedBodyDefTpe.params map {case (bridgeSym, param) => adapt(Ident(bridgeSym), bridgeSym.tpe, param.tpe)}).unzip
+          val body = Apply(Select(gen.mkAttributedThis(newClass), applyMethod.symbol), adaptedParams)
+          val (neededReturn, adaptedBody) = adapt(body, liftedBodyDefTpe.resultType, ObjectClass.tpe)
+          if (neededParams.contains(true) || neededReturn) {
+            val methDef = DefDef(methSym, List(bridgeParams), adaptedBody)
+            newClass.info.decls enter methSym
+            Some(methDef)
+          } else None map {x => (localTyper typed x).asInstanceOf[DefDef]}
+        }
+      }
   } // DelambdafyTransformer
-  
 
   class FreeVarTraverser extends Traverser {
     val freeVars = mutable.LinkedHashSet[Symbol]()
