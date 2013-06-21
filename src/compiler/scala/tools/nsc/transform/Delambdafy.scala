@@ -147,18 +147,17 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       def createConstructor(newClass: Symbol, members: List[ValDef]): DefDef = {
         val constrSym = newClass.newConstructor(originalFunction.pos, SYNTHETIC)
         
-        val (paramTypes, params, assigns) = (members map {member => 
-          val paramType = member.symbol.info.typeSymbol
+        val (paramSymbols, params, assigns) = (members map {member =>
           val paramSymbol = newClass.newVariable(member.symbol.name.toTermName, newClass.pos, 0)
           paramSymbol.setInfo(member.symbol.info)
           val paramVal = ValDef(paramSymbol)
           val paramIdent = Ident(paramSymbol)
           val assign = Assign(Select(gen.mkAttributedThis(newClass), member.symbol), paramIdent)
           
-          (paramType, paramVal, assign)
+          (paramSymbol, paramVal, assign)
         }).unzip3
         
-        val constrType = MethodType(paramTypes, newClass.thisType)
+        val constrType = MethodType(paramSymbols, newClass.thisType)
         constrSym setInfo constrType
 
         newClass.info.decls enter constrSym
