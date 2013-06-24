@@ -27,6 +27,26 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
   class DelambdafyTransformer(unit: CompilationUnit) extends TypingTransformer(unit) {
     private val lambdaClassDefs = new mutable.LinkedHashMap[Symbol, List[Tree]] withDefaultValue Nil
     
+    val thisReferringMethods = {
+      val thisReferringMethodsTraverser = new ThisReferringMethodsTraverser()
+      thisReferringMethodsTraverser traverse unit.body
+      val methodReferringMap = thisReferringMethodsTraverser.liftedMethodReferences
+      val referrers = thisReferringMethodsTraverser.thisReferringMethods
+      // recursively find methods that refer to 'this' directly or indirectly via references to other methods
+      // for each method found add it to the referrers set
+      def refersToThis(symbol: Symbol): Boolean = {
+        if (referrers contains symbol) true
+        else if (methodReferringMap(symbol) exists refersToThis) {
+          // add it early to memoize
+          debuglog(s"$symbol indirectly refers to 'this'")
+          referrers += symbol
+          true
+        } else false
+      }
+      methodReferringMap.keys foreach refersToThis
+      referrers
+    }
+    
     override def transform(tree: Tree): Tree = tree match {
       case fun @ Function(_, _) => {
         val (lambdaClassDef, newExpr) = transformFunction(fun)
@@ -84,6 +104,8 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
           case Apply(meth, _) => 
             meth.symbol resetFlag PRIVATE
             meth.symbol setFlag PROTECTED
+            // if the lifted body method doesn't refer to this then it can be static
+            if(!(thisReferringMethods contains meth.symbol)) meth.symbol setFlag STATIC
           case huh => 
             error(s"expected a function body consisting only of a method application but got $huh")
         }
@@ -166,7 +188,13 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
 	    val decapturify = new DeCapturifyTransformer(captureProxies2, unit, oldClass, anonClass, originalFunction.symbol.pos)
 	
 	    val fun = decapturify.transform(originalFunction).asInstanceOf[Function]
-	    val thisProxy = decapturify.thisProxy
+        
+        val Function(_, Apply(target, _)) = fun
+	    val thisProxy = if (thisReferringMethods contains target.symbol) {
+          val sym = anonClass.newVariable(nme.FAKE_LOCAL_THIS, fun.pos, SYNTHETIC) // TODO PRIVATE
+          sym.info = oldClass.tpe
+          Some(sym)
+	    } else None
         
         val members = (thisProxy.toList ++ (captureProxies2 map (_._2))) map {member =>
           anonClass.info.decls enter member
@@ -299,15 +327,8 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
   }
   
   class DeCapturifyTransformer(captureProxies: Map[Symbol, TermSymbol], unit: CompilationUnit, oldClass: Symbol, newClass:Symbol, pos: Position) extends TypingTransformer(unit) {
-    var thisProxy: Option[Symbol] = None
 
     override def transform(tree: Tree) = tree match {
-      case tree@This(encl) if tree.symbol == oldClass  => if (thisProxy == None) {
-          val sym = newClass.newVariable(nme.FAKE_LOCAL_THIS, pos, SYNTHETIC) // TODO PRIVATE
-          sym.info = oldClass.tpe
-          thisProxy = Some(sym)
-        }
-        localTyper typed Select(gen.mkAttributedThis(newClass), thisProxy.get)
       case Ident(name) if (captureProxies contains tree.symbol) => 
         localTyper typed Select(gen.mkAttributedThis(newClass), captureProxies(tree.symbol))
       case _ => super.transform(tree)
@@ -316,5 +337,39 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
 
   private lazy val serialVersionUIDAnnotation =
     AnnotationInfo(SerialVersionUIDAttr.tpe, List(Literal(Constant(0))), List())
+  
+  // finds all methods that reference 'this'
+  class ThisReferringMethodsTraverser() extends Traverser {
+    private var currentMethod: Option[Symbol] = None
+    // the set of methods that refer to this
+    val thisReferringMethods = mutable.Set[Symbol]()
+    // the set of lifted lambda body methods that each method refers to
+    val liftedMethodReferences = mutable.Map[Symbol, Set[Symbol]]().withDefault(_ => mutable.Set())
+    override def traverse(tree: Tree) = tree match {
+      case DefDef(_, _, _, _, _, _) =>
+        // we don't expect defs within defs. At this phase trees should be very flat
+        assert(currentMethod.isEmpty)
+        currentMethod = Some(tree.symbol)
+        super.traverse(tree)
+        currentMethod = None
+      case Function(_, Apply(target, _)) => 
+        // we don't drill into functions because at the beginning of this phase they will always refer to 'this'. 
+        // They'll be of the form {(args...) => this.anonfun(args...)}
+        // but we do need to make note of the lifted body method in case it refers to 'this'
+        currentMethod foreach {m => liftedMethodReferences(m) += target.symbol}
+      case Function(_, _) => 
+        // any other shape of Function is unexpected at this point
+        assert(false, s"could not understand function with tree $tree")
+      case This(_) =>
+        currentMethod foreach {method =>
+          if (tree.symbol == method.enclClass) {
+            debuglog(s"$method directly refers to 'this'")
+            thisReferringMethods add method
+          }
+        }
+      case _ =>
+        super.traverse(tree)
+    }
+  }
 
 }
