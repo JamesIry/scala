@@ -170,7 +170,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       }
 
       // anonymous subclass of FunctionN with an apply method
-      val (anonymousClassDef, thisProxy) = {
+      def makeAnonymousClass = {
         val parents = addSerializable(abstractFunctionErasedType)
         // TODO add serialuid
         val name = unit.freshTypeName(oldClass.name.decode + tpnme.ANON_FUN_NAME.decode)
@@ -185,16 +185,18 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
 	      (capture, sym)
 	    })
 	
-	    val decapturify = new DeCapturifyTransformer(captureProxies2, unit, oldClass, anonClass, originalFunction.symbol.pos)
+	    val thisProxy = {
+          val target = targetMethod(originalFunction)
+	      if (thisReferringMethods contains target) {
+            val sym = anonClass.newVariable(nme.FAKE_LOCAL_THIS, originalFunction.pos, SYNTHETIC) // TODO PRIVATE
+            sym.info = oldClass.tpe
+            Some(sym)
+	      } else None
+	    }
+        
+	    val decapturify = new DeCapturifyTransformer(captureProxies2, unit, oldClass, anonClass, originalFunction.symbol.pos, thisProxy)
 	
 	    val fun = decapturify.transform(originalFunction).asInstanceOf[Function]
-        
-        val Function(_, Apply(target, _)) = fun
-	    val thisProxy = if (thisReferringMethods contains target.symbol) {
-          val sym = anonClass.newVariable(nme.FAKE_LOCAL_THIS, fun.pos, SYNTHETIC) // TODO PRIVATE
-          sym.info = oldClass.tpe
-          Some(sym)
-	    } else None
         
         val members = (thisProxy.toList ++ (captureProxies2 map (_._2))) map {member =>
           anonClass.info.decls enter member
@@ -215,6 +217,8 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         (localTyper.typed(ClassDef(anonClass, template) setPos fun.pos).asInstanceOf[ClassDef], thisProxy)
       }
       
+      val (anonymousClassDef, thisProxy) = makeAnonymousClass
+            
       pkg.info.decls enter anonymousClassDef.symbol
       
       val thisArg = thisProxy.toList map (_ => gen.mkAttributedThis(oldClass) setPos originalFunction.pos)
@@ -326,13 +330,27 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
     }
   }
   
-  class DeCapturifyTransformer(captureProxies: Map[Symbol, TermSymbol], unit: CompilationUnit, oldClass: Symbol, newClass:Symbol, pos: Position) extends TypingTransformer(unit) {
+  class DeCapturifyTransformer(captureProxies: Map[Symbol, TermSymbol], unit: CompilationUnit, oldClass: Symbol, newClass:Symbol, pos: Position, thisProxy: Option[Symbol]) extends TypingTransformer(unit) {
 
     override def transform(tree: Tree) = tree match {
+      case tree@This(encl) if tree.symbol == oldClass && thisProxy.isDefined => 
+        localTyper typed Select(gen.mkAttributedThis(newClass), thisProxy.get)
       case Ident(name) if (captureProxies contains tree.symbol) => 
         localTyper typed Select(gen.mkAttributedThis(newClass), captureProxies(tree.symbol))
       case _ => super.transform(tree)
     }
+  }
+  
+  /**
+   * Get the symbol of the target lifted lambad body method from a function. I.e. if
+   * the function is {args => anonfun(args)} then this method returns anonfun's symbol 
+   */
+  private def targetMethod(fun: Function): Symbol = fun match {
+    case Function(_, Apply(target, _)) => 
+      target.symbol
+    case _ => 
+      // any other shape of Function is unexpected at this point
+      sys.error(s"could not understand function with tree $fun")      
   }
 
   private lazy val serialVersionUIDAnnotation =
@@ -352,14 +370,11 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         currentMethod = Some(tree.symbol)
         super.traverse(tree)
         currentMethod = None
-      case Function(_, Apply(target, _)) => 
+      case fun@Function(_, _) => 
         // we don't drill into functions because at the beginning of this phase they will always refer to 'this'. 
         // They'll be of the form {(args...) => this.anonfun(args...)}
         // but we do need to make note of the lifted body method in case it refers to 'this'
-        currentMethod foreach {m => liftedMethodReferences(m) += target.symbol}
-      case Function(_, _) => 
-        // any other shape of Function is unexpected at this point
-        assert(false, s"could not understand function with tree $tree")
+        currentMethod foreach {m => liftedMethodReferences(m) += targetMethod(fun)}
       case This(_) =>
         currentMethod foreach {method =>
           if (tree.symbol == method.enclClass) {
