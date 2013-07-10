@@ -47,16 +47,23 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       referrers
     }
     
+    val accessorMethods = mutable.ArrayBuffer[Tree]()
+    
     override def transform(tree: Tree): Tree = tree match {
-      case fun @ Function(_, _) => {
-        val (lambdaClassDef, newExpr) = transformFunction(fun)
+      case fun @ Function(_, _) =>
+        val (lambdaClassDef, newExpr, accessorMethod) = transformFunction(fun)
+        accessorMethods += accessorMethod
         val pkg = lambdaClassDef.symbol.owner
                
         lambdaClassDefs(pkg) = lambdaClassDef :: lambdaClassDefs(pkg)
         
         val transformedNewExpr = super.transform(newExpr)
         transformedNewExpr
-      }
+      case Template(_, _, _) =>
+        val Template(parents, self, body) = super.transform(tree)
+        val newTemplate = Template(parents, self, body ++ accessorMethods)
+        accessorMethods.clear()
+        newTemplate
       case _ => super.transform(tree)
     }
    
@@ -71,7 +78,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       }
     }    
 
-    def transformFunction(originalFunction: Function): (ClassDef, Tree) = {
+    def transformFunction(originalFunction: Function): (ClassDef, Tree, Tree) = {
       val functionTpe = originalFunction.tpe 
       val targs = functionTpe.typeArgs
       val (formals, restpe) = (targs.init, targs.last)
@@ -84,38 +91,64 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       /**
        * Creates the apply method for the anonymous subclass of FunctionN
        */
-      def createApplyMethod(newClass: Symbol, fun: Function): DefDef = {
-        val methSym = newClass.newMethod(nme.apply, fun.pos, FINAL | SYNTHETIC)
-        val originalParams = fun.vparams map (_.duplicate)
+      def createAccessorMethod(thisProxy: Option[Symbol], fun: Function): DefDef = {
+        val target = targetMethod(fun)
+        if (!thisProxy.isDefined) {
+          target setFlag STATIC
+        }
+        val params = ((thisProxy map {proxy:Symbol => ValDef(proxy)}) ++ (target.paramss.flatten map ValDef)).toList
 
-        val paramSyms = map2(formals, originalParams) {
+        val methSym = oldClass.newMethod(unit.freshTermName(nme.accessor.toString()), target.pos, FINAL | BRIDGE | SYNTHETIC | PROTECTED | STATIC)
+
+        val paramSyms = params map {param => methSym.newSyntheticValueParam(param.symbol.tpe, param.name) }
+          
+        params zip paramSyms foreach { case (valdef, sym) => valdef.symbol = sym }
+        params foreach (_.symbol.owner = methSym)
+        
+        val methodType = MethodType(paramSyms, restpe)
+        methSym setInfo methodType
+      
+        oldClass.info.decls enter methSym
+
+        val body = localTyper.typed {
+          val newTarget = if (thisProxy.isDefined) Select(Ident(paramSyms(0)), target) else Select(gen.mkAttributedThis(oldClass), target)
+          val newParams = paramSyms drop (if (thisProxy.isDefined) 1 else 0) map Ident
+          Apply(newTarget, newParams)
+        } setPos fun.pos
+        val methDef = DefDef(methSym, List(params), body)
+
+        // Have to repack the type to avoid mismatches when existentials
+        // appear in the result - see SI-4869.
+        // TODO probably don't need packedType
+        methDef.tpt setType localTyper.packedType(body, methSym)
+        methDef
+      }
+
+      /**
+       * Creates the apply method for the anonymous subclass of FunctionN
+       */
+      def createApplyMethod(newClass: Symbol, fun: Function, accessor: DefDef, thisProxy: Option[Symbol]): DefDef = {
+        val methSym = newClass.newMethod(nme.apply, fun.pos, FINAL | SYNTHETIC)
+        val params = fun.vparams map (_.duplicate)
+
+        val paramSyms = map2(formals, params) {
           (tp, vparam) => methSym.newSyntheticValueParam(tp, vparam.name)
         }
-        originalParams zip paramSyms foreach { case (valdef, sym) => valdef.symbol = sym }
-        originalParams foreach (_.symbol.owner = methSym)
+        params zip paramSyms foreach { case (valdef, sym) => valdef.symbol = sym }
+        params foreach (_.symbol.owner = methSym)
         
         val methodType = MethodType(paramSyms, restpe)
         methSym setInfo methodType
       
         newClass.info.decls enter methSym
-
-        // the apply method needs to call the lifted method so that lifted method cannot be private
-        fun.body match {
-          case Apply(meth, _) => 
-            meth.symbol resetFlag PRIVATE
-            meth.symbol setFlag PROTECTED
-            // if the lifted body method doesn't refer to this then it can be static
-            if(!(thisReferringMethods contains meth.symbol)) meth.symbol setFlag STATIC
-          case huh => 
-            error(s"expected a function body consisting only of a method application but got $huh")
-        }
         
-        val vparams = originalParams
-        val body = localTyper.typed {
-            fun.body.substituteSymbols(fun.vparams map (_.symbol), vparams map (_.symbol))
-            fun.body changeOwner (fun.symbol -> methSym)
-        } setPos fun.pos
-        val methDef = DefDef(methSym, List(vparams), body)
+        val Apply(_, oldParams) = fun.body
+        
+        val body = localTyper typed Apply(Select(gen.mkAttributedThis(oldClass), accessor.symbol), (thisProxy map {tp => Select(gen.mkAttributedThis(newClass), tp)}).toList ++ oldParams)
+        body.substituteSymbols(fun.vparams map (_.symbol), params map (_.symbol))
+        body changeOwner (fun.symbol -> methSym)
+        
+        val methDef = DefDef(methSym, List(params), body)
 
         // Have to repack the type to avoid mismatches when existentials
         // appear in the result - see SI-4869.
@@ -196,28 +229,30 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         
 	    val decapturify = new DeCapturifyTransformer(captureProxies2, unit, oldClass, anonClass, originalFunction.symbol.pos, thisProxy)
 	
-	    val fun = decapturify.transform(originalFunction).asInstanceOf[Function]
-        
+        val accessorMethod = createAccessorMethod(thisProxy, originalFunction)
+       
+	    val decapturedFunction = decapturify.transform(originalFunction).asInstanceOf[Function]
+          
         val members = (thisProxy.toList ++ (captureProxies2 map (_._2))) map {member =>
           anonClass.info.decls enter member
-          ValDef(member, gen.mkZero(member.tpe)) setPos fun.pos
+          ValDef(member, gen.mkZero(member.tpe)) setPos decapturedFunction.pos
         }
         
         // constructor
         val constr = createConstructor(anonClass, members)
         
         // apply method with same arguments and return type as original lambda.
-        val applyMethodDef = createApplyMethod(anonClass, fun)
+        val applyMethodDef = createApplyMethod(anonClass, decapturedFunction, accessorMethod, thisProxy)
         
         val bridgeMethod = createBridgeMethod(anonClass, originalFunction, applyMethodDef)
         
-        val template = Template(anonClass.info.parents map TypeTree, emptyValDef, members ++ List(constr, applyMethodDef) ++ bridgeMethod) setPos fun.pos
+        val template = Template(anonClass.info.parents map TypeTree, emptyValDef, members ++ List(constr, applyMethodDef) ++ bridgeMethod) setPos decapturedFunction.pos
         
         // TODO if member fields are private this complains that they're not accessible
-        (localTyper.typed(ClassDef(anonClass, template) setPos fun.pos).asInstanceOf[ClassDef], thisProxy)
+        (localTyper.typed(ClassDef(anonClass, template) setPos decapturedFunction.pos).asInstanceOf[ClassDef], thisProxy, accessorMethod)
       }
       
-      val (anonymousClassDef, thisProxy) = makeAnonymousClass
+      val (anonymousClassDef, thisProxy, accessorMethod) = makeAnonymousClass
             
       pkg.info.decls enter anonymousClassDef.symbol
       
@@ -230,7 +265,7 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       val typedNewStat = 
           localTyper.typed(newStat)
 
-      (anonymousClassDef, typedNewStat)
+      (anonymousClassDef, typedNewStat, accessorMethod)
     }
     
     def createBridgeMethod(newClass:Symbol, originalFunction: Function, applyMethod: DefDef): Option[DefDef] = {
