@@ -305,7 +305,15 @@ abstract class UnCurry extends InfoTransform
                 fun.body changeOwner (fun.symbol -> methSym)
             }
             // callsite for the lifted method
-            val args = fun.vparams map {vparam => Ident(vparam.symbol)}
+            val args = fun.vparams map { vparam =>
+              val ident = Ident(vparam.symbol)
+              // if -Yeta-expand-keeps-star is turned on then T* types can get through. In order
+              // to forward them we need to forward x: T* ascribed as "x:_*"
+              if (settings.etaExpandKeepsStar && definitions.isRepeatedParamType(vparam.tpt.tpe))
+                gen.wildcardStar(ident)
+              else
+                ident
+            }
             val liftedMethodCall = funTyper(Apply(liftedMethod.symbol, args:_*))
             
             // new function whose body is just a call to the lifted method
