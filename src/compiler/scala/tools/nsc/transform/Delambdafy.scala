@@ -246,6 +246,24 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
         
         val bridgeMethod = createBridgeMethod(anonClass, originalFunction, applyMethodDef)
         
+        def fulldef(sym: Symbol) =
+          if (sym == NoSymbol) sym.toString
+          else s"$sym: ${sym.tpe} in ${sym.owner}"
+          
+        def clashError(bm: Symbol) = {
+          unit.error(
+            applyMethodDef.symbol.pos,
+              sm"""bridge generated for member ${fulldef(applyMethodDef.symbol)}
+                |which overrides ${fulldef(getMember(abstractFunctionErasedType.typeSymbol, nme.apply))}
+                |clashes with definition of the member itself;
+                |both have erased type ${exitingPostErasure(bm.tpe)}""")
+        }
+        
+        bridgeMethod foreach {bm =>
+          if (bm.symbol.tpe =:= applyMethodDef.symbol.tpe)
+            clashError(bm.symbol)
+        }
+        
         val template = Template(anonClass.info.parents map TypeTree, emptyValDef, members ++ List(constr, applyMethodDef) ++ bridgeMethod) setPos decapturedFunction.pos
         
         // TODO if member fields are private this complains that they're not accessible
