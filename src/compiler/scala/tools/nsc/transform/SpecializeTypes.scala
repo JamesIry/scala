@@ -1290,8 +1290,12 @@ abstract class SpecializeTypes extends InfoTransform with TypingTransformers {
         else sym1 eq sym2
     }
 
-    private def isAccessible(sym: Symbol): Boolean =
-      (currentClass == sym.owner.enclClass) && (currentClass != targetClass)
+    private def isAccessible(sym: Symbol): Boolean = {
+      val curClass = currentClass
+      val ownersMatch = curClass == sym.owner.enclClass 
+      val res = ownersMatch && (curClass != targetClass)
+      res
+    }
 
     private def shouldMakePublic(sym: Symbol): Boolean =
       sym.hasFlag(PRIVATE | PROTECTED) && (addressFields || !nme.isLocalName(sym.name))
