@@ -262,7 +262,7 @@ abstract class UnCurry extends InfoTransform
             vparams zip paramSyms foreach {case (valdef, sym) => valdef.symbol = sym}
             vparams foreach (_.symbol.owner = methSym)
             
-            val methodType = MethodType(paramSyms, restpe)
+            val methodType = MethodType(paramSyms, restpe.deconst)
             methSym setInfo methodType
             
             val body = localTyper.typedPos(fun.pos)(bodyF(methSym, vparams))
@@ -270,7 +270,7 @@ abstract class UnCurry extends InfoTransform
 
             // Have to repack the type to avoid mismatches when existentials
             // appear in the result - see SI-4869.
-            methDef.tpt setType localTyper.packedType(body, methSym)
+            methDef.tpt setType localTyper.packedType(body, methSym).deconst
             methDef
             
           }
