@@ -63,6 +63,7 @@ abstract class UnCurry extends InfoTransform
 // uncurry and uncurryType expand type aliases
 
   class UnCurryTransformer(unit: CompilationUnit) extends TypingTransformer(unit) {
+    private val inlineFunctionExpansion = settings.Ydelambdafy.value == "inline"
     private var needTryLift       = false
     private var inPattern         = false
     private var inConstructorFlag = 0L
@@ -265,7 +266,8 @@ abstract class UnCurry extends InfoTransform
             val methodType = MethodType(paramSyms, restpe.deconst)
             methSym setInfo methodType
             
-            val body = localTyper.typedPos(fun.pos)(bodyF(methSym, vparams))
+            val tempBody = bodyF(methSym, vparams)
+            val body = localTyper.typedPos(fun.pos)(tempBody)
             val methDef = DefDef(methSym, List(vparams), body)
 
             // Have to repack the type to avoid mismatches when existentials
@@ -275,10 +277,9 @@ abstract class UnCurry extends InfoTransform
             
           }
 
-          val inline = settings.Ydelambdafy.value == "inline"
           val funTyper = localTyper.typedPos(fun.pos) _
 
-          if (inline) {
+          val block = if (inlineFunctionExpansion) {
             // if delambdafy strategy is inline then 
             // fall back to putting the body of the lambda directly in the anonymous class
             // anonymous subclass of FunctionN with an apply method
@@ -296,12 +297,11 @@ abstract class UnCurry extends InfoTransform
               anonClass.info.decls enter applyMethodDef.symbol
               ClassDef(anonClass, NoMods, ListOfNil, List(applyMethodDef), fun.pos)
             }
-
-            mainTransform(funTyper {
-              Block(
-                List(anonymousClassDef),
-                Typed(New(anonymousClassDef.symbol), TypeTree(fun.tpe)))
-            })
+            
+            Block(
+              List(anonymousClassDef),
+              Typed(New(anonymousClassDef.symbol), TypeTree(fun.tpe))
+            ) 
           } else {
             val methodFlags = ARTIFACT
             // method definition with the same arguments, return type, and body as the original lambda
@@ -324,14 +324,12 @@ abstract class UnCurry extends InfoTransform
             
             // new function whose body is just a call to the lifted method
             val newFun = fun.replace(fun.body, liftedMethodCall)
-            funTyper {
-              Block(
-                List(mainTransform(funTyper(liftedMethod))),
-                super.transform(newFun)
-              )
-            }
+            Block(
+              List(funTyper(liftedMethod)),
+              super.transform(newFun)
+            )
           }
-
+          funTyper(block)
         }
     }
 
@@ -578,9 +576,17 @@ abstract class UnCurry extends InfoTransform
             val pat1 = withInPattern(value = true)(transform(pat))
             treeCopy.CaseDef(tree, pat1, transform(guard), transform(body))
 
+          // if a lambda is already the right shape we don't need to transform it again
+          case fun @ Function(_, Apply(target, _)) if (!inlineFunctionExpansion) && target.symbol.isLocal =>
+            super.transform(fun)
+
           case fun @ Function(_, _) =>
-            transformFunction(fun)
- 
+            val fun1 = transformFunction(fun)
+            if (fun1 ne fun)
+              mainTransform(fun1)
+            else
+              super.transform(fun1)
+
           case Template(_, _, _) =>
             withInConstructorFlag(0) { super.transform(tree) }
 
