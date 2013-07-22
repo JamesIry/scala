@@ -206,7 +206,10 @@ abstract class Delambdafy extends Transform with TypingTransformers with ast.Tre
       def makeAnonymousClass = {
         val parents = addSerializable(abstractFunctionErasedType)
         // TODO add serialuid
-        val name = unit.freshTypeName(oldClass.name.decode + tpnme.ANON_FUN_NAME.decode)
+        val funOwner = originalFunction.symbol.owner
+        val ownerSuffix = if (funOwner.isPrimaryConstructor) ""
+        else "$" + funOwner.name
+        val name = unit.freshTypeName(oldClass.name.decode + "$" + tpnme.ANON_FUN_NAME.decode + ownerSuffix + "$")
         
         val anonClass = pkg newClassSymbol(name, originalFunction.pos, FINAL | SYNTHETIC) addAnnotation serialVersionUIDAnnotation
         anonClass setInfo ClassInfoType(parents, newScope, anonClass)
