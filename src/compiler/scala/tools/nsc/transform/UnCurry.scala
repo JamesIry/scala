@@ -577,7 +577,7 @@ abstract class UnCurry extends InfoTransform
             treeCopy.CaseDef(tree, pat1, transform(guard), transform(body))
 
           // if a lambda is already the right shape we don't need to transform it again
-          case fun @ Function(_, Apply(target, _)) if (!inlineFunctionExpansion) && target.symbol.isLocal =>
+          case fun @ Function(_, Apply(target, _)) if (!inlineFunctionExpansion) && target.symbol.isArtifact && target.symbol.name.containsName(nme.ANON_FUN_NAME) =>
             super.transform(fun)
 
           case fun @ Function(_, _) =>
